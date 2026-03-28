@@ -72,12 +72,6 @@ def is_script_running_as_root():
     return os.geteuid() == 0 or os.getuid() == 0
 
 
-if is_script_running_as_root():
-    print()
-    error("This setup script should not be run as root/superuser. Exiting.\n")
-    sys.exit(1)
-
-
 def signal_handler(sig, frame):
     """Handle signals like Ctrl+C"""
     if sig in (signal.SIGINT, signal.SIGQUIT):
@@ -4925,6 +4919,11 @@ def main():
 
         run_install_sequence(cnfg)
         safe_shutdown(0)    # redundant, but that's OK
+
+    elif is_script_running_as_root():
+        print()
+        error("This setup script should not be run as root/superuser. Exiting.\n")
+        sys.exit(1)
 
     elif args.command == 'install':
         if args.override_distro:
