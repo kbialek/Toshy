@@ -4686,7 +4686,8 @@ def run_install_sequence(cnfg: InstallerSettings):
             # that are actually compatible with the KWin script (5/6).
             check_kde_app_switcher()
 
-    elevate_privileges()
+    if not cnfg.unprivileged_user:
+        elevate_privileges()
 
     if not cnfg.skip_native and not cnfg.unprivileged_user:
         # This will also be skipped if user proceeds with
@@ -4862,6 +4863,12 @@ def main():
         action='store_true',
         help='See README for more info on this option.'
     )
+    subparser_install.add_argument(
+        '--unprivileged-user',
+        default=False,
+        action='store_true',
+        help='Skip installation steps requiring elevated permissions'
+    )
 
 
     subparser_list_distros      = subparsers.add_parser(
@@ -4945,6 +4952,9 @@ def main():
 
         if args.fancy_pants:
             cnfg.fancy_pants = True
+
+        if args.unprivileged_user:
+            cnfg.unprivileged_user = True
 
         run_install_sequence(cnfg)
         safe_shutdown(0)    # redundant, but that's OK
