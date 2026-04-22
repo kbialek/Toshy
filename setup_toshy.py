@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = '20260330'                        # CLI option "--version" will print this out.
+__version__ = '20260416'                        # CLI option "--version" will print this out.
 
 import os
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'     # prevent this script from creating cache files
@@ -40,7 +40,7 @@ original_print = builtins.print
 # Override the print function
 def print(*args, **kwargs):
     # Set flush to True, to force logging to be in correct order.
-    # Some terminals do weird buffering, cause out-of-order logs.
+    # Some terminals do weird buffering, causing out-of-order logs.
     kwargs['flush'] = True
     original_print(*args, **kwargs)  # Call the original print
 
@@ -262,6 +262,7 @@ class InstallerSettings:
         self.tweak_applied          = None
         self.remind_extensions      = None
         self.enabled_gnome_exts     = None
+        self.dwt_quirk_installed    = None
         self.should_reboot          = None
 
         self.run_tmp_dir            = run_tmp_dir
@@ -632,6 +633,12 @@ def can_skip_reboot():
     Determine if reboot can be skipped despite should_reboot being set.
     If permissions are working and service is running, uaccess did its job.
     """
+
+    # A freshly installed DWT quirk genuinely needs a compositor restart
+    # (log out or reboot) — device permissions being fine doesn't help.
+    if cnfg.dwt_quirk_installed:
+        return False
+
     perms_ok, perms_msg = verify_device_permissions()
     if not perms_ok:
         debug(f"Permission check failed: {perms_msg}")
@@ -850,9 +857,10 @@ def check_gnome_indicator_ext():
     if cnfg.DESKTOP_ENV != 'gnome':
         return
 
-    indicator_extensions = [
+    known_appindicator_exts = [
         'appindicatorsupport@rgcjonas.gmail.com',
         'ubuntu-appindicators@ubuntu.com',
+        'zorin-appindicator@zorinos.com',
         'TopIcons@phocean.net',
         'top-icons-redux@pop-planet.info',
         'trayIconsReloaded@selfmade.pl',
@@ -863,7 +871,7 @@ def check_gnome_indicator_ext():
     sys_ext_dir = '/usr/share/gnome-shell/extensions'
 
     installed_exts = []
-    for ext_uuid in indicator_extensions:
+    for ext_uuid in known_appindicator_exts:
         user_path = os.path.join(user_ext_dir, ext_uuid)
         sys_path = os.path.join(sys_ext_dir, ext_uuid)
         if os.path.exists(user_path) or os.path.exists(sys_path):
@@ -1372,7 +1380,8 @@ pip_pkgs   = [
     # "xkbregistry",
 
     ############################################################################################
-    # Everything below here is just to make the keymapper (xwaykeyz) install smoother.
+    # Everything below here is just to make the keymapper (xwaykeyz) install smoother, preventing
+    # any terminal output that the user might mistake for an "error".
 
     "appdirs",                  # Get appropriate platform-specific directories for app data/config
     "evdev",                    # Interface with Linux input system for keyboard/mouse event handling
@@ -1405,7 +1414,7 @@ def get_supported_distro_ids_lst():
 
 def get_supported_distro_ids_idx() -> str:
     """Utility function to return list of available distro names (IDs)"""
-    distro_list = []
+    distro_list: 'list[str]' = []
 
     for group in distro_groups_map.values():
         distro_list.extend(group)
@@ -2837,7 +2846,8 @@ def install_libinput_dwt_quirk():
 
     # If we get here it means we installed the libinput quirk, so user needs to
     # at least log out, or restart the system to activate the quirk.
-    cnfg.should_reboot = True
+    cnfg.dwt_quirk_installed    = True
+    cnfg.should_reboot          = True
 
     show_task_completed_msg()
 
