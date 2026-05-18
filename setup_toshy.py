@@ -73,12 +73,6 @@ def is_script_running_as_root():
     return os.geteuid() == 0 or os.getuid() == 0
 
 
-if is_script_running_as_root():
-    print()
-    error("This setup script should not be run as root/superuser. Exiting.\n")
-    sys.exit(1)
-
-
 def signal_handler(sig, frame):
     """Handle signals like Ctrl+C"""
     if sig in (signal.SIGINT, signal.SIGQUIT):
@@ -5244,7 +5238,8 @@ def run_install_sequence(cnfg: InstallerSettings):
             # that are actually compatible with the KWin script (5/6).
             check_kde_app_switcher()
 
-    elevate_privileges()
+    if not cnfg.unprivileged_user:
+        elevate_privileges()
 
     if not cnfg.skip_native and not cnfg.unprivileged_user:
         # This will also be skipped if user proceeds with
@@ -5420,6 +5415,12 @@ def main():
         action='store_true',
         help='See README for more info on this option.'
     )
+    subparser_install.add_argument(
+        '--unprivileged-user',
+        default=False,
+        action='store_true',
+        help='Skip installation steps requiring elevated permissions'
+    )
 
 
     subparser_list_distros      = subparsers.add_parser(
@@ -5478,6 +5479,11 @@ def main():
         run_install_sequence(cnfg)
         safe_shutdown(0)    # redundant, but that's OK
 
+    elif is_script_running_as_root():
+        print()
+        error("This setup script should not be run as root/superuser. Exiting.\n")
+        sys.exit(1)
+
     elif args.command == 'install':
         if args.override_distro:
             cnfg.override_distro = args.override_distro
@@ -5498,6 +5504,10 @@ def main():
 
         if args.fancy_pants:
             cnfg.fancy_pants = True
+
+        if args.unprivileged_user:
+            cnfg.unprivileged_user = True
+
         run_install_sequence(cnfg)
         safe_shutdown(0)    # redundant, but that's OK
 
