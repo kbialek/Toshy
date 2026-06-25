@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__version__ = '20260404'
+__version__ = '20260621'
 ###############################################################################
 ############################   Welcome to Toshy!   ############################
 ###
@@ -24,6 +24,7 @@ import time
 import shutil
 import asyncio
 import inspect
+import textwrap
 import subprocess
 
 # Removing problematic types before they get deprecated:
@@ -95,6 +96,19 @@ devices_api(
 )
 
 
+# Requires xwaykeyz v1.23.0 or later
+try:
+    keyboard_layout_correction(
+        correction_enabled  = False,
+        correct_number_row  = False,
+        symbol_miss_policy  = 'fold',
+        folded_miss_policy  = 'placeholder',
+        symbol_placeholder  = '?'
+    )
+except NameError:
+    pass
+
+
 ###########################################################
 # Use this ONLY if you want near zero CPU usage for held,
 # repeating keys. This will bypass the new repeating keys
@@ -114,7 +128,9 @@ devices_api(
 
 
 
-
+###################################################################################################
+# Some important setup work necessary to make custom preferences,
+# notifications and Synergy log monitoring work.
 home_dir = os.path.expanduser('~')
 icons_dir = os.path.join(home_dir, '.local', 'share', 'icons')
 
@@ -124,12 +140,19 @@ current_folder_path = os.path.dirname(os.path.abspath(config_globals["__config__
 sys.path.insert(0, current_folder_path)
 
 # Local imports after path has been set
-from toshy_common.env_context import EnvironmentInfo
-from toshy_common.machine_context import get_machine_id_hash
-from toshy_common.notification_manager import NotificationManager
-from toshy_common.runtime_utils import sanitize_text
-from toshy_common.settings_class import Settings
-from toshy_common.terminal_utils import print_pango_text
+from toshy_common.env_context           import EnvironmentInfo
+from toshy_common.kblayout_setup        import current_layout_name, start_kblayout_correction
+from toshy_common.machine_context       import get_machine_id_hash
+from toshy_common.notification_manager  import NotificationManager
+from toshy_common.overlay_context       import OverlayFlag as OFlag
+from toshy_common.proc_launcher         import launch_detached
+from toshy_common.runtime_utils         import sanitize_text
+from toshy_common.settings_class        import Settings
+from toshy_common.terminal_utils        import render_pango_text
+
+# Start up the mechanism that optionally auto-corrects keycodes that
+# differ from the standard US-default key definitions in kernel/keymapper.
+start_kblayout_correction()
 
 assets_path         = os.path.join(current_folder_path, 'assets')
 icon_file_active    = os.path.join(assets_path, "toshy_app_icon_rainbow.svg")
@@ -137,7 +160,7 @@ icon_file_grayscale = os.path.join(assets_path, "toshy_app_icon_rainbow_inverse_
 icon_file_inverse   = os.path.join(assets_path, "toshy_app_icon_rainbow_inverse.svg")
 
 # Toshy config file
-TOSHY_PART      = 'config'   # CUSTOMIZE TO SPECIFIC TOSHY COMPONENT! (gui, tray, config)
+TOSHY_PART      = 'config-barebones'   # CUSTOMIZE TO SPECIFIC TOSHY COMPONENT! (gui, tray, config)
 TOSHY_PART_NAME = 'Toshy Barebones Config'
 APP_VERSION     = __version__
 
@@ -296,14 +319,13 @@ MACHINE_ID = get_machine_id_hash()
 # Establish important global variables here
 
 
-STARTUP_TIMESTAMP = time.time()     # only gets evaluated once for each run of keymapper
-
 # Variable to hold the keyboard type
 KBTYPE = None
 
 # Short names for the `xwaykeyz/keyszer` string and Unicode processing helper functions
-ST = to_US_keystrokes           # was 'to_keystrokes' originally
-UC = unicode_keystrokes
+ST      = str_to_keystrokes              # 'to_US_keystrokes' is deprecated
+UC      = unicode_addr_to_keystrokes     # 'unicode_keystrokes' is deprecated
+UCS     = unicode_str_to_keystrokes
 ignore_combo = ComboHint.IGNORE
 
 ###############################################################################
@@ -487,7 +509,7 @@ def isKBtype(kbtype: str, map=None):
 kbtype_cache_dct = {}
 
 
-def getKBtype():
+def getKBtype(ctx: KeyContext):
     """
     ### Get the keyboard type string for the current device
 
@@ -507,66 +529,64 @@ def getKBtype():
 
     valid_kbtypes = ['IBM', 'Chromebook', 'Windows', 'Apple']
 
-    def _getKBtype(ctx: KeyContext):
-        # debug(f"Entering getKBtype with override value: '{cnfg.override_kbtype}'")
-        global KBTYPE
-        kbd_dev_name = ctx.device_name
+    # debug(f"Entering getKBtype with override value: '{cnfg.override_kbtype}'")
+    global KBTYPE
+    kbd_dev_name = ctx.device_name
 
-        def log_kbtype(msg, cache_dev):
-            debug(f"KBTYPE: '{KBTYPE}' | {msg}: '{kbd_dev_name}'")
-            if cache_dev:
-                kbtype_cache_dct[kbd_dev_name] = (KBTYPE, msg)
+    def log_kbtype(msg, cache_dev):
+        debug(f"KBTYPE: '{KBTYPE}' | {msg}: '{kbd_dev_name}'")
+        if cache_dev:
+            kbtype_cache_dct[kbd_dev_name] = (KBTYPE, msg)
 
-        # If user wants to override, apply override and return.
-        # Breaks per-device adaptatation capability while engaged!
-        if cnfg.override_kbtype in valid_kbtypes:
-            KBTYPE = cnfg.override_kbtype
-            log_kbtype(f"WARNING: Override applied! Dev", cache_dev=False)
-            return
+    # If user wants to override, apply override and return.
+    # Breaks per-device adaptatation capability while engaged!
+    if cnfg.override_kbtype in valid_kbtypes:
+        KBTYPE = cnfg.override_kbtype
+        log_kbtype(f"WARNING: Override applied! Dev", cache_dev=False)
+        return
 
-        # Check in the kbtype cache dict for the device
-        if kbd_dev_name in kbtype_cache_dct:
-            KBTYPE, cached_msg = kbtype_cache_dct[kbd_dev_name]
-            log_kbtype(f'(CACHED) {cached_msg}', cache_dev=False)
-            return
+    # Check in the kbtype cache dict for the device
+    if kbd_dev_name in kbtype_cache_dct:
+        KBTYPE, cached_msg = kbtype_cache_dct[kbd_dev_name]
+        log_kbtype(f'(CACHED) {cached_msg}', cache_dev=False)
+        return
 
-        kbd_dev_name_cf = ctx.device_name.casefold()
+    kbd_dev_name_cf = ctx.device_name.casefold()
 
-        # Check if there is a custom type for the device
-        custom_kbtype = kbds_UserCustom_dct_cf.get(kbd_dev_name_cf, '')
-        if custom_kbtype and custom_kbtype in valid_kbtypes:
-            KBTYPE = custom_kbtype
-            log_kbtype('Custom type for dev', cache_dev=True)
-            return
+    # Check if there is a custom type for the device
+    custom_kbtype = kbds_UserCustom_dct_cf.get(kbd_dev_name_cf, '')
+    if custom_kbtype and custom_kbtype in valid_kbtypes:
+        KBTYPE = custom_kbtype
+        log_kbtype('Custom type for dev', cache_dev=True)
+        return
 
-        # Check against the keyboard type lists
-        for kbtype, regex_lst in kbtype_lists_rgx.items():
-            for rgx in regex_lst:
-                if rgx.search(kbd_dev_name_cf):
-                    KBTYPE = kbtype
-                    log_kbtype('Rgx matched on dev', cache_dev=True)
-                    return
-
-        # Check if any keyboard type string is found in the device name
-        for kbtype in ['IBM', 'Chromebook', 'Windows', 'Apple']:
-            if kbtype.casefold() in kbd_dev_name_cf:
+    # Check against the keyboard type lists
+    for kbtype, regex_lst in kbtype_lists_rgx.items():
+        for rgx in regex_lst:
+            if rgx.search(kbd_dev_name_cf):
                 KBTYPE = kbtype
-                log_kbtype('Type in dev name', cache_dev=True)
+                log_kbtype('Rgx matched on dev', cache_dev=True)
                 return
 
-        # Check if the device name indicates a "Windows" keyboard
-        if ('windows' not in kbd_dev_name_cf
-            and not not_win_type_rgx.search(kbd_dev_name_cf)
-            and not all_kbds_rgx.search(kbd_dev_name_cf) ):
-            KBTYPE = 'Windows'
-            log_kbtype('Default type for dev', cache_dev=True)
+    # Check if any keyboard type string is found in the device name
+    for kbtype in ['IBM', 'Chromebook', 'Windows', 'Apple']:
+        if kbtype.casefold() in kbd_dev_name_cf:
+            KBTYPE = kbtype
+            log_kbtype('Type in dev name', cache_dev=True)
             return
 
-        # Default to None if no matching keyboard type is found
-        KBTYPE = 'unidentified'
-        error(f"KBTYPE: '{KBTYPE}' | Dev fell through all checks: '{kbd_dev_name}'")
+    # Check if the device name indicates a "Windows" keyboard
+    if ('windows' not in kbd_dev_name_cf
+        and not not_win_type_rgx.search(kbd_dev_name_cf)
+        and not all_kbds_rgx.search(kbd_dev_name_cf) ):
+        KBTYPE = 'Windows'
+        log_kbtype('Default type for dev', cache_dev=True)
+        return
 
-    return _getKBtype  # Return the inner function
+    # Default to None if no matching keyboard type is found
+    KBTYPE = 'unidentified'
+    error(f"KBTYPE: '{KBTYPE}' | Dev fell through all checks: '{kbd_dev_name}'")
+
 
 
 def isDoubleTap(dt_combo):
@@ -636,17 +656,21 @@ def isDoubleTap(dt_combo):
 
 def macro_tester():
     """Type out a macro with useful info and a Unicode test.
-        WARNING: Safe only for use in apps that accept text blocks/typing of many characters."""
+        WARNING: Safe only for use in apps that accept text blocks/typing of many characters.
+        Character marker in front of each line is a canary to see if Combo outputs are 
+        being corrected for the layout, not just strings going through ST()."""
     def _macro_tester(ctx: KeyContext):
         return [
-                    C("Enter"),
-                    ST(f"Class: '{ctx.wm_class}'"), C("Enter"),
-                    ST(f"Title: '{ctx.wm_name}'"), C("Enter"),
-                    ST(f"Keybd: '{ctx.device_name}'"), C("Enter"),
-                    ST(f"Keyboard type: '{KBTYPE}'"), C("Enter"),
-                    ST("Next test should come out on ONE LINE!"), C("Enter"),
-                    ST("Unicode and Shift Test: 🌹—€—\u2021—ÿ—\U00002021 12345 !@#$% |\\ !!!!!!"),
-                    C("Enter"), C("Enter"),
+            C("Enter"),
+            C("o"), ST(f" Class: '{ctx.wm_class}'"),                                C("Enter"),
+            C("o"), ST(f" Title: '{ctx.wm_name}'"),                                 C("Enter"),
+            C("o"), ST(f" Keybd: '{ctx.device_name}'"),                             C("Enter"),
+            C("o"), ST(f" Keyboard type: '{KBTYPE}'"),                              C("Enter"),
+            C("o"), ST(f" Active Layout: '{current_layout_name()}'"),               C("Enter"),
+            C("o"), ST(f" Shift timing test: 12345 !@#$% |\\ !!!!!!"),              C("Enter"),
+            C("o"), ST(f" Unicode req's Shift+Ctrl+U shortcut (ibus, fcitx5)"),     C("Enter"),
+            C("o"), ST(f" Unicode test: "), UCS("🌹—€—\u2021—ÿ—\U00002021"),        C("Enter"),
+            # C("Enter"),
         ]
     return _macro_tester
 
@@ -761,18 +785,23 @@ def notify_context():
         kdialog_cmd_lst += ['--icon', 'toshy_app_icon_rainbow']
 
         if dialog_cmd == kdialog_cmd:
-            subprocess.Popen(kdialog_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            # subprocess.Popen(kdialog_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            launch_detached(kdialog_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
         elif dialog_cmd == zenity_cmd:
-            subprocess.Popen(zenity_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            # subprocess.Popen(zenity_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            launch_detached(zenity_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
 
-        # Also print out the diagnostics to the terminal, in case the dialog doesn't work.
+        # Also send diagnostics to verbose debug logging, in case the dialog doesn't work.
         # Trim the last 4 lines (dialog-only hints) for terminal output
         term_message = nwln_str.join(message.split(nwln_str)[:-4])
-        print(f"\n{'=' * 50}")
-        print(f"  Toshy Context Info (diagnostic dialog content)")
-        print(f"{'=' * 50}")
-        print_pango_text(term_message, nwln_str)
-        print()     # separate from following lines
+        rendered_message = render_pango_text(term_message, nwln_str)
+        diag_block = (
+            f"\n{'=' * 50}\n"
+            f"  Toshy Context Info (diagnostic dialog content)\n"
+            f"{'=' * 50}\n"
+            f"{rendered_message}\n"
+        )
+        debug(f"\n{textwrap.indent(diag_block, ' ' * 5)}\n")
 
         # Optionally, also send a system notification:
         # ntfy.send_notification(message)
@@ -831,6 +860,42 @@ def get_output():
     return None
 
 
+def _decorrect_for_multitap(command):
+    """Apply the keymapper's output layout de-correction to a multi-tap command,
+    mirroring what handle_commands does to every command before it reaches output.
+
+    This processor is a parallel reimplementation of handle_commands and so does
+    NOT inherit its de-correction step; without this, a bare Combo/Key emitted by
+    a multi-tap action goes out US-positional and renders the wrong symbol on a
+    non-US layout (e.g. C('Minus') -> ')' on AZERTY), while string-emitter output
+    is unaffected because it is already PreCorrectedCombo.
+
+    The de-correction function and the correction-map probe are read off the live
+    transform module via sys.modules — the same runtime-access pattern get_output
+    uses for _output — so this stays inside toshy_config and adds no import across
+    the keymapper boundary. Gated on a correction map being installed, exactly as
+    handle_commands gates its own call. On any failure, or when no map is present,
+    the command is returned unchanged so multi-tap output is never lost.
+
+    NOTE: this patches the reimplementation. The real fix is to route multi-tap
+    emission through handle_commands so this concern (and any other drift from it)
+    cannot recur; that relocation is tracked separately."""
+    try:
+        transform_module = sys.modules.get('xwaykeyz.transform')
+        if transform_module is None:
+            return command
+        get_correction_map = getattr(transform_module, 'get_correction_map', None)
+        decorrect_command = getattr(transform_module, '_decorrect_output_command', None)
+        if get_correction_map is None or decorrect_command is None:
+            return command
+        if not get_correction_map():
+            return command                  # US-like layout: nothing to de-correct
+        return decorrect_command(command)
+    except Exception as decorrect_err:
+        debug(f"## multitap: de-correction skipped ({decorrect_err})")
+        return command
+
+
 def process_multitap_command(command, ctx):
     """Simplified recursive command processor based on handle_commands logic"""
     debug(f"## multitap: Processing command: {type(command)}")
@@ -862,6 +927,11 @@ def process_multitap_command(command, ctx):
         # Handle direct objects (Combo, Key, etc.)
         output = get_output()
         if output and hasattr(command, '__class__'):
+            # De-correct for the active layout before emitting, the same way
+            # handle_commands does (de-correct, then dispatch). Leaves a
+            # PreCorrectedCombo untouched and returns the same kind of object, so
+            # the class-name dispatch below still classifies it correctly.
+            command = _decorrect_for_multitap(command)
             class_name = command.__class__.__name__
             debug(f"## multitap: Direct object class: {class_name}")
 
@@ -931,6 +1001,13 @@ def multitap_config(tap_interval=None, min_tap_delay=None):
         _MULTITAP_CONFIG['min_tap_delay'] = _MULTITAP_CONFIG['tap_interval'] * 0.25
         debug(f"## multitap_config: min_tap_delay ({original_delay}s) >= tap_interval, "
                 f"adjusted to {_MULTITAP_CONFIG['min_tap_delay']:.3f}s")
+
+
+# Grace period (seconds) between tap-sequence finalization and action emission.
+# Long enough for an already-in-flight modifier release to be processed by the
+# loop (so resume_keys lifts the trigger mods before the macro starts), short
+# enough to be imperceptible. Tunable; kept well under min_tap_delay.
+_MULTITAP_EMIT_GRACE = 0.15
 
 
 def isMultiTap( tap_1_action: 'Callable | None' = None,
@@ -1004,23 +1081,31 @@ def isMultiTap( tap_1_action: 'Callable | None' = None,
             debug(f"## isMultiTap: No action defined for {tap_count} taps on {action_key}")
 
     def finalize_taps(action_key: tuple, captured_ctx):
-        """Called when tap sequence is finalized."""
-        if action_key in tap_states:
-            state = tap_states[action_key]
-            tap_count = state['count']
-            debug(f"## isMultiTap: Finalizing {tap_count} taps for {action_key}")
+        """Called when tap sequence is finalized. Defers the actual action
+        emission by a short grace period (via loop.call_later) so the event loop
+        can process any pending modifier-release events first; this lets the
+        keymapper lift the trigger modifiers through its normal resume path
+        before the action emits, avoiding per-character modifier wrapping without
+        touching output or keystate internals."""
+        if action_key not in tap_states:
+            return
 
-            # Get the actions before cleaning up state
-            stored_tap_1_action = state['tap_1_action']
-            stored_tap_2_action = state['tap_2_action']
-            stored_tap_3_action = state['tap_3_action']
-            stored_tap_4_action = state['tap_4_action']
-            stored_tap_5_action = state['tap_5_action']
+        state = tap_states[action_key]
+        tap_count = state['count']
+        debug(f"## isMultiTap: Finalizing {tap_count} taps for {action_key}")
 
-            # Clean up state
-            del tap_states[action_key]
+        # Snapshot the actions before cleaning up state.
+        stored_tap_1_action = state['tap_1_action']
+        stored_tap_2_action = state['tap_2_action']
+        stored_tap_3_action = state['tap_3_action']
+        stored_tap_4_action = state['tap_4_action']
+        stored_tap_5_action = state['tap_5_action']
 
-            # Execute appropriate action with captured context
+        # Clean up state now; the deferred emit below captures everything it
+        # needs, so the per-combo state entry is free to go.
+        del tap_states[action_key]
+
+        def _emit():
             execute_action_for_tap_count(   tap_count,
                                             captured_ctx,
                                             stored_tap_1_action,
@@ -1028,6 +1113,16 @@ def isMultiTap( tap_1_action: 'Callable | None' = None,
                                             stored_tap_3_action,
                                             stored_tap_4_action,
                                             stored_tap_5_action)
+
+        loop = get_loop()
+        if loop is None:
+            # No loop to reschedule on: emit inline rather than drop the action.
+            # Worst case is per-character wrapping (slower), never a lost action.
+            debug("## isMultiTap: no loop for grace delay, emitting inline")
+            _emit()
+            return
+
+        loop.call_later(_MULTITAP_EMIT_GRACE, _emit)
 
     def _isMultiTap(ctx) -> None:
         loop = get_loop()
@@ -1160,7 +1255,7 @@ keymap("Diagnostics (isMultiTap)", {
                                 C("Enter"), C("Enter")],
                         ),
 
-}, when = lambda _: True is True)
+}, when = lambda _: True)
 
 
 # keymap("Diagnostics (isDoubleTap)", {
@@ -1168,4 +1263,3 @@ keymap("Diagnostics (isMultiTap)", {
 #     C("Shift-Alt-RC-h"):        isDoubleTap(notify_context),    # Diagnostic dialog (alternate)
 #     C("Shift-Alt-RC-t"):        isDoubleTap(macro_tester),      # Type out test macro
 # }, when = lambda _: True is True)
-

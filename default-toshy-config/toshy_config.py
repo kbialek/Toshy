@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__version__ = '20260506'
+__version__ = '20260621'
 ###############################################################################
 ############################   Welcome to Toshy!   ############################
 ###
@@ -24,6 +24,7 @@ import time
 import shutil
 import asyncio
 import inspect
+import textwrap
 import subprocess
 
 # Removing problematic types before they get deprecated:
@@ -93,6 +94,19 @@ devices_api(
         # 'Example Wireless Receiver Mouse',
     ],
 )
+
+
+# Requires xwaykeyz v1.23.0 or later
+try:
+    keyboard_layout_correction(
+        correction_enabled  = False,
+        correct_number_row  = False,
+        symbol_miss_policy  = 'fold',
+        folded_miss_policy  = 'placeholder',
+        symbol_placeholder  = '?'
+    )
+except NameError:
+    pass
 
 
 ###########################################################
@@ -194,13 +208,19 @@ current_folder_path = os.path.dirname(os.path.abspath(config_globals["__config__
 sys.path.insert(0, current_folder_path)
 
 # Local imports after path has been set
-from toshy_common.env_context import EnvironmentInfo
-from toshy_common.machine_context import get_machine_id_hash
-from toshy_common.notification_manager import NotificationManager
-from toshy_common.overlay_context import OverlayFlag as OFlag
-from toshy_common.runtime_utils import sanitize_text
-from toshy_common.settings_class import Settings
-from toshy_common.terminal_utils import print_pango_text
+from toshy_common.env_context           import EnvironmentInfo
+from toshy_common.kblayout_setup        import current_layout_name, start_kblayout_correction
+from toshy_common.machine_context       import get_machine_id_hash
+from toshy_common.notification_manager  import NotificationManager
+from toshy_common.overlay_context       import OverlayFlag as OFlag
+from toshy_common.proc_launcher         import launch_detached
+from toshy_common.runtime_utils         import sanitize_text
+from toshy_common.settings_class        import Settings
+from toshy_common.terminal_utils        import render_pango_text
+
+# Start up the mechanism that optionally auto-corrects keycodes that
+# differ from the standard US-default key definitions in kernel/keymapper.
+start_kblayout_correction()
 
 assets_path         = os.path.join(current_folder_path, 'assets')
 icon_file_active    = os.path.join(assets_path, "toshy_app_icon_rainbow.svg")
@@ -371,8 +391,9 @@ MACHINE_ID = get_machine_id_hash()
 KBTYPE = None
 
 # Short names for the `xwaykeyz/keyszer` string and Unicode processing helper functions
-ST = to_US_keystrokes           # was 'to_keystrokes' originally
-UC = unicode_keystrokes
+ST      = str_to_keystrokes              # 'to_US_keystrokes' is deprecated
+UC      = unicode_addr_to_keystrokes     # 'unicode_keystrokes' is deprecated
+UCS     = unicode_str_to_keystrokes
 ignore_combo = ComboHint.IGNORE
 
 ###############################################################################
@@ -957,27 +978,6 @@ def getKBtype(ctx: KeyContext):
     error(f"KBTYPE: '{KBTYPE}' | Dev fell through all checks: '{kbd_dev_name}'")
 
 
-# ─── Add to existing module-level ctx_* globals ────────────────────
-# Place after the ctx_kbd_is_* block.
-
-# Built-in overlay flag states
-ctx_ovl_macos_globals           = False
-ctx_ovl_terminal_ergo           = False
-ctx_ovl_finder_mods             = False
-ctx_ovl_enter_to_rename         = False
-ctx_ovl_browser_shortcuts       = False
-ctx_ovl_vscode_shortcuts        = False
-ctx_ovl_dialog_ergo             = False
-
-# User overlay flag states
-ctx_ovl_user_flag_a             = False
-ctx_ovl_user_flag_b             = False
-ctx_ovl_user_flag_c             = False
-ctx_ovl_user_flag_d             = False
-ctx_ovl_user_flag_e             = False
-ctx_ovl_user_flag_f             = False
-
-
 def _context_pre_check(ctx: KeyContext):
     """Side-effect trigger: pre-computes per-event context once at the
     top of the event chain, so downstream keymaps and modmaps can read
@@ -1005,6 +1005,8 @@ def _context_pre_check(ctx: KeyContext):
     global ctx_ovl_finder_mods, ctx_ovl_enter_to_rename
     global ctx_ovl_browser_shortcuts
     global ctx_ovl_vscode_shortcuts
+    global ctx_ovl_level3_left_alt
+
     global ctx_ovl_user_flag_a, ctx_ovl_user_flag_b, ctx_ovl_user_flag_c
     global ctx_ovl_user_flag_d, ctx_ovl_user_flag_e, ctx_ovl_user_flag_f
 
@@ -1026,20 +1028,22 @@ def _context_pre_check(ctx: KeyContext):
     # clause evaluations downstream.
     mask = cnfg.overlay_mask
 
-    ctx_ovl_macos_globals       = mask & OFlag.MACOS_GLOBALS
-    ctx_ovl_terminal_ergo       = mask & OFlag.TERMINAL_ERGO
-    ctx_ovl_finder_mods         = mask & OFlag.FINDER_MODS
-    ctx_ovl_enter_to_rename     = mask & OFlag.ENTER_TO_RENAME
-    ctx_ovl_browser_shortcuts   = mask & OFlag.BROWSER_SHORTCUTS
-    ctx_ovl_vscode_shortcuts    = mask & OFlag.VSCODE_SHORTCUTS
-    ctx_ovl_dialog_ergo         = mask & OFlag.DIALOG_ERGO
-
-    ctx_ovl_user_flag_a         = mask & OFlag.USER_FLAG_A
-    ctx_ovl_user_flag_b         = mask & OFlag.USER_FLAG_B
-    ctx_ovl_user_flag_c         = mask & OFlag.USER_FLAG_C
-    ctx_ovl_user_flag_d         = mask & OFlag.USER_FLAG_D
-    ctx_ovl_user_flag_e         = mask & OFlag.USER_FLAG_E
-    ctx_ovl_user_flag_f         = mask & OFlag.USER_FLAG_F
+    # Wrapping with bool() just to convert to from overlay values to True/False for
+    # consistency with other ctx_* variables and safe usage in "when" conditions.
+    ctx_ovl_macos_globals       = bool(mask & OFlag.MACOS_GLOBALS)
+    ctx_ovl_terminal_ergo       = bool(mask & OFlag.TERMINAL_ERGO)
+    ctx_ovl_finder_mods         = bool(mask & OFlag.FINDER_MODS)
+    ctx_ovl_enter_to_rename     = bool(mask & OFlag.ENTER_TO_RENAME)
+    ctx_ovl_browser_shortcuts   = bool(mask & OFlag.BROWSER_SHORTCUTS)
+    ctx_ovl_vscode_shortcuts    = bool(mask & OFlag.VSCODE_SHORTCUTS)
+    ctx_ovl_dialog_ergo         = bool(mask & OFlag.DIALOG_ERGO)
+    ctx_ovl_level3_left_alt     = bool(mask & OFlag.LEVEL3_LEFT_ALT)
+    ctx_ovl_user_flag_a         = bool(mask & OFlag.USER_FLAG_A)
+    ctx_ovl_user_flag_b         = bool(mask & OFlag.USER_FLAG_B)
+    ctx_ovl_user_flag_c         = bool(mask & OFlag.USER_FLAG_C)
+    ctx_ovl_user_flag_d         = bool(mask & OFlag.USER_FLAG_D)
+    ctx_ovl_user_flag_e         = bool(mask & OFlag.USER_FLAG_E)
+    ctx_ovl_user_flag_f         = bool(mask & OFlag.USER_FLAG_F)
 
     # Maintain the Enter-to-rename latch (resets when focus leaves a file manager)
     _get_iEF2_context(ctx)
@@ -1208,17 +1212,21 @@ def iEF2NT():
 
 def macro_tester():
     """Type out a macro with useful info and a Unicode test.
-        WARNING: Safe only for use in apps that accept text blocks/typing of many characters."""
+        WARNING: Safe only for use in apps that accept text blocks/typing of many characters.
+        Character marker in front of each line is a canary to see if Combo outputs are 
+        being corrected for the layout, not just strings going through ST()."""
     def _macro_tester(ctx: KeyContext):
         return [
-                    C("Enter"),
-                    ST(f"Class: '{ctx.wm_class}'"), C("Enter"),
-                    ST(f"Title: '{ctx.wm_name}'"), C("Enter"),
-                    ST(f"Keybd: '{ctx.device_name}'"), C("Enter"),
-                    ST(f"Keyboard type: '{KBTYPE}'"), C("Enter"),
-                    ST("Next test should come out on ONE LINE!"), C("Enter"),
-                    ST("Unicode and Shift Test: 🌹—€—\u2021—ÿ—\U00002021 12345 !@#$% |\\ !!!!!!"),
-                    C("Enter"), C("Enter"),
+            C("Enter"),
+            C("o"), ST(f" Class: '{ctx.wm_class}'"),                                C("Enter"),
+            C("o"), ST(f" Title: '{ctx.wm_name}'"),                                 C("Enter"),
+            C("o"), ST(f" Keybd: '{ctx.device_name}'"),                             C("Enter"),
+            C("o"), ST(f" Keyboard type: '{KBTYPE}'"),                              C("Enter"),
+            C("o"), ST(f" Active Layout: '{current_layout_name()}'"),               C("Enter"),
+            C("o"), ST(f" Shift timing test: 12345 !@#$% |\\ !!!!!!"),              C("Enter"),
+            C("o"), ST(f" Unicode req's Shift+Ctrl+U shortcut (ibus, fcitx5)"),     C("Enter"),
+            C("o"), ST(f" Unicode test: "), UCS("🌹—€—\u2021—ÿ—\U00002021"),        C("Enter"),
+            # C("Enter"),
         ]
     return _macro_tester
 
@@ -1291,17 +1299,18 @@ def notify_context():
         ctx_name        = ctx.wm_name
         ctx_devn        = ctx.device_name
 
-        # ------ following are all True/False
-        ctx_term        = hmp_is_terminal(ctx)
-        ctx_rmte        = hmp_is_remote(ctx)
-        ctx_fmgr        = hmp_is_filemanager(ctx)
-        ctx_brws        = hmp_is_browser(ctx)
-        ctx_vscd        = hmp_is_vscode(ctx)
-
         if hmp_is_dialog_closewin(ctx) or hmp_is_dialog_escape(ctx):
-            ctx_dlgs        = True
+            _ctx_dlgs        = True
         else:
-            ctx_dlgs        = False
+            _ctx_dlgs        = False
+
+        # ------ following are all True/False
+        ctx_term        = '[ X ]' if hmp_is_terminal(ctx)         else '[   ]'
+        ctx_rmte        = '[ X ]' if hmp_is_remote(ctx)           else '[   ]'
+        ctx_fmgr        = '[ X ]' if hmp_is_filemanager(ctx)      else '[   ]'
+        ctx_brws        = '[ X ]' if hmp_is_browser(ctx)          else '[   ]'
+        ctx_vscd        = '[ X ]' if hmp_is_vscode(ctx)           else '[   ]'
+        ctx_dlgs        = '[ X ]' if _ctx_dlgs                    else '[   ]'
 
         message         = (
             f"<tt>"
@@ -1320,13 +1329,13 @@ def notify_context():
             f"<b> • DE_MAJ_VER ___________</b> '{DE_MAJ_VER     }' {nwln_str}"
             f"<b> • WINDOW_MGR ___________</b> '{WINDOW_MGR     }' {nwln_str}"
             f"{nwln_str}"
-            f"<b>Do any app class groups match on this window?:</b>  {nwln_str}"
-            f"<b> • Terminals ____________</b> '{ctx_term}' {nwln_str}"
-            f"<b> • Remotes/VMs __________</b> '{ctx_rmte}' {nwln_str}"
-            f"<b> • File Managers ________</b> '{ctx_fmgr}' {nwln_str}"
-            f"<b> • Web Browsers _________</b> '{ctx_brws}' {nwln_str}"
-            f"<b> • VSCode(s) ____________</b> '{ctx_vscd}' {nwln_str}"
-            f"<b> • Dialogs ______________</b> '{ctx_dlgs}' {nwln_str}"
+            f"<b>App class groups that match on this window:</b>  {nwln_str}"
+            f"<b> • Terminals ____________</b> {ctx_term} {nwln_str}"
+            f"<b> • Remotes/VMs __________</b> {ctx_rmte} {nwln_str}"
+            f"<b> • File Managers ________</b> {ctx_fmgr} {nwln_str}"
+            f"<b> • Web Browsers _________</b> {ctx_brws} {nwln_str}"
+            f"<b> • VSCode(s) ____________</b> {ctx_vscd} {nwln_str}"
+            f"<b> • Dialogs ______________</b> {ctx_dlgs} {nwln_str}"
             f"{nwln_str}"
             f"<b> __________________________________________________ </b>{nwln_str}"
             f"<i>Keyboard shortcuts (Ctrl+C/Cmd+C) may not work here.</i>{nwln_str}"
@@ -1353,18 +1362,23 @@ def notify_context():
         kdialog_cmd_lst += ['--icon', 'toshy_app_icon_rainbow']
 
         if dialog_cmd == kdialog_cmd:
-            subprocess.Popen(kdialog_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            # subprocess.Popen(kdialog_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            launch_detached(kdialog_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
         elif dialog_cmd == zenity_cmd:
-            subprocess.Popen(zenity_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            # subprocess.Popen(zenity_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
+            launch_detached(zenity_cmd_lst, cwd=icons_dir, stderr=DEVNULL, stdout=DEVNULL)
 
-        # Also print out the diagnostics to the terminal, in case the dialog doesn't work.
+        # Also send diagnostics to verbose debug logging, in case the dialog doesn't work.
         # Trim the last 4 lines (dialog-only hints) for terminal output
         term_message = nwln_str.join(message.split(nwln_str)[:-4])
-        print(f"\n{'=' * 50}")
-        print(f"  Toshy Context Info (diagnostic dialog content)")
-        print(f"{'=' * 50}")
-        print_pango_text(term_message, nwln_str)
-        print()     # separate from following lines
+        rendered_message = render_pango_text(term_message, nwln_str)
+        diag_block = (
+            f"\n{'=' * 50}\n"
+            f"  Toshy Context Info (diagnostic dialog content)\n"
+            f"{'=' * 50}\n"
+            f"{rendered_message}\n"
+        )
+        debug(f"\n{textwrap.indent(diag_block, ' ' * 5)}\n")
 
         # Optionally, also send a system notification:
         # ntfy.send_notification(message)
@@ -1540,6 +1554,42 @@ def get_output():
     return None
 
 
+def _decorrect_for_multitap(command):
+    """Apply the keymapper's output layout de-correction to a multi-tap command,
+    mirroring what handle_commands does to every command before it reaches output.
+
+    This processor is a parallel reimplementation of handle_commands and so does
+    NOT inherit its de-correction step; without this, a bare Combo/Key emitted by
+    a multi-tap action goes out US-positional and renders the wrong symbol on a
+    non-US layout (e.g. C('Minus') -> ')' on AZERTY), while string-emitter output
+    is unaffected because it is already PreCorrectedCombo.
+
+    The de-correction function and the correction-map probe are read off the live
+    transform module via sys.modules — the same runtime-access pattern get_output
+    uses for _output — so this stays inside toshy_config and adds no import across
+    the keymapper boundary. Gated on a correction map being installed, exactly as
+    handle_commands gates its own call. On any failure, or when no map is present,
+    the command is returned unchanged so multi-tap output is never lost.
+
+    NOTE: this patches the reimplementation. The real fix is to route multi-tap
+    emission through handle_commands so this concern (and any other drift from it)
+    cannot recur; that relocation is tracked separately."""
+    try:
+        transform_module = sys.modules.get('xwaykeyz.transform')
+        if transform_module is None:
+            return command
+        get_correction_map = getattr(transform_module, 'get_correction_map', None)
+        decorrect_command = getattr(transform_module, '_decorrect_output_command', None)
+        if get_correction_map is None or decorrect_command is None:
+            return command
+        if not get_correction_map():
+            return command                  # US-like layout: nothing to de-correct
+        return decorrect_command(command)
+    except Exception as decorrect_err:
+        debug(f"## multitap: de-correction skipped ({decorrect_err})")
+        return command
+
+
 def process_multitap_command(command, ctx):
     """Simplified recursive command processor based on handle_commands logic"""
     debug(f"## multitap: Processing command: {type(command)}")
@@ -1571,6 +1621,11 @@ def process_multitap_command(command, ctx):
         # Handle direct objects (Combo, Key, etc.)
         output = get_output()
         if output and hasattr(command, '__class__'):
+            # De-correct for the active layout before emitting, the same way
+            # handle_commands does (de-correct, then dispatch). Leaves a
+            # PreCorrectedCombo untouched and returns the same kind of object, so
+            # the class-name dispatch below still classifies it correctly.
+            command = _decorrect_for_multitap(command)
             class_name = command.__class__.__name__
             debug(f"## multitap: Direct object class: {class_name}")
 
@@ -1640,6 +1695,13 @@ def multitap_config(tap_interval=None, min_tap_delay=None):
         _MULTITAP_CONFIG['min_tap_delay'] = _MULTITAP_CONFIG['tap_interval'] * 0.25
         debug(f"## multitap_config: min_tap_delay ({original_delay}s) >= tap_interval, "
                 f"adjusted to {_MULTITAP_CONFIG['min_tap_delay']:.3f}s")
+
+
+# Grace period (seconds) between tap-sequence finalization and action emission.
+# Long enough for an already-in-flight modifier release to be processed by the
+# loop (so resume_keys lifts the trigger mods before the macro starts), short
+# enough to be imperceptible. Tunable; kept well under min_tap_delay.
+_MULTITAP_EMIT_GRACE = 0.15
 
 
 def isMultiTap( tap_1_action: 'Callable | None' = None,
@@ -1713,23 +1775,31 @@ def isMultiTap( tap_1_action: 'Callable | None' = None,
             debug(f"## isMultiTap: No action defined for {tap_count} taps on {action_key}")
 
     def finalize_taps(action_key: tuple, captured_ctx):
-        """Called when tap sequence is finalized."""
-        if action_key in tap_states:
-            state = tap_states[action_key]
-            tap_count = state['count']
-            debug(f"## isMultiTap: Finalizing {tap_count} taps for {action_key}")
+        """Called when tap sequence is finalized. Defers the actual action
+        emission by a short grace period (via loop.call_later) so the event loop
+        can process any pending modifier-release events first; this lets the
+        keymapper lift the trigger modifiers through its normal resume path
+        before the action emits, avoiding per-character modifier wrapping without
+        touching output or keystate internals."""
+        if action_key not in tap_states:
+            return
 
-            # Get the actions before cleaning up state
-            stored_tap_1_action = state['tap_1_action']
-            stored_tap_2_action = state['tap_2_action']
-            stored_tap_3_action = state['tap_3_action']
-            stored_tap_4_action = state['tap_4_action']
-            stored_tap_5_action = state['tap_5_action']
+        state = tap_states[action_key]
+        tap_count = state['count']
+        debug(f"## isMultiTap: Finalizing {tap_count} taps for {action_key}")
 
-            # Clean up state
-            del tap_states[action_key]
+        # Snapshot the actions before cleaning up state.
+        stored_tap_1_action = state['tap_1_action']
+        stored_tap_2_action = state['tap_2_action']
+        stored_tap_3_action = state['tap_3_action']
+        stored_tap_4_action = state['tap_4_action']
+        stored_tap_5_action = state['tap_5_action']
 
-            # Execute appropriate action with captured context
+        # Clean up state now; the deferred emit below captures everything it
+        # needs, so the per-combo state entry is free to go.
+        del tap_states[action_key]
+
+        def _emit():
             execute_action_for_tap_count(   tap_count,
                                             captured_ctx,
                                             stored_tap_1_action,
@@ -1737,6 +1807,16 @@ def isMultiTap( tap_1_action: 'Callable | None' = None,
                                             stored_tap_3_action,
                                             stored_tap_4_action,
                                             stored_tap_5_action)
+
+        loop = get_loop()
+        if loop is None:
+            # No loop to reschedule on: emit inline rather than drop the action.
+            # Worst case is per-character wrapping (slower), never a lost action.
+            debug("## isMultiTap: no loop for grace delay, emitting inline")
+            _emit()
+            return
+
+        loop.call_later(_MULTITAP_EMIT_GRACE, _emit)
 
     def _isMultiTap(ctx) -> None:
         loop = get_loop()
@@ -2007,6 +2087,21 @@ multipurpose_modmap("Caps2Esc - Chromebook kbd", {
     not ctx_app_is_remote
 )
 
+multipurpose_modmap("Cond multi-modmap - Alt_Gr on Menu key", {
+    # Only gets to level 3/4 special characters on a layout that has "Level3 Shift" on
+    # the right-side Alt (Alt_Gr) key. Won't really do anything on layouts where
+    # that key is just Alt_R. Compose/Menu key will just become another Alt_R key.
+    # But this means there will be an Option/Alt key equivalent on the correct
+    # key position on many PC laptop keyboards.
+    # As a multipurpose modmap, the Menu/Compose key can continue to activate context
+    # menus like it normally does, when tapped alone.
+    Key.COMPOSE:                [Key.COMPOSE, Key.RIGHT_ALT],                  # Menu/Compose → Alt_Gr (Level3/4)
+}, when = lambda ctx:
+    cnfg.altgr_on_menu_key and
+    cnfg.screen_has_focus and
+    not ctx_app_is_remote
+)
+
 
 # THIS IS ALL SUPERCEDED BY THE NEW SOLUTION OF MONITORING THE SYNERGY LOG FILE!
 # Fix for avoiding modmapping when using Synergy keyboard/mouse sharing.
@@ -2025,6 +2120,238 @@ multipurpose_modmap("Caps2Esc - Chromebook kbd", {
 # Or:
 # modmap("Synergy fix", {}, when = lambda ctx: ctx.wm_class == '' and not ctx.wm_name == 'gnome-shell')
 # PROBLEM: When GNOME desktop has focus, it sets no window info at all (no class, no name/title)
+
+
+# # [Global GUI conditional modmaps] Change modifier keys as in xmodmap
+# modmap("Cond modmap - GUI - Caps2Cmd - not Cbk kdb", {
+#     Key.CAPSLOCK:               Key.RIGHT_CTRL,                 # Caps2Cmd
+# }, when = lambda ctx:
+#     cnfg.Caps2Cmd and
+#     cnfg.screen_has_focus and
+#     not ctx_kbd_is_chromebook and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - Caps2Cmd - Cbk kdb", {
+#     Key.LEFT_META:              Key.RIGHT_CTRL,                 # Caps2Cmd - Chromebook
+# }, when = lambda ctx:
+#     cnfg.Caps2Cmd and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_chromebook and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - IBM kbd - multi_lang OFF", {
+#     # - IBM
+#     Key.RIGHT_ALT:              Key.RIGHT_CTRL,                 # IBM - Multi-language (Remove)
+#     Key.RIGHT_CTRL:             Key.RIGHT_ALT,                  # IBM - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_ibm and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - IBM kbd", {
+#     # - IBM
+#     Key.CAPSLOCK:               Key.LEFT_META,                  # IBM
+#     Key.LEFT_CTRL:              Key.LEFT_ALT,                   # IBM
+#     Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # IBM
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_ibm and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - Cbk kbd - multi_lang OFF", {
+#     # - Chromebook
+#     Key.RIGHT_ALT:              Key.RIGHT_CTRL,                 # Chromebook - Multi-language (Remove)
+#     Key.RIGHT_CTRL:             Key.RIGHT_ALT,                  # Chromebook - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_chromebook and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - Cbk kbd", {
+#     # - Chromebook
+#     Key.LEFT_CTRL:              Key.LEFT_ALT,                   # Chromebook
+#     Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # Chromebook
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_chromebook and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - Win kbd - multi_lang OFF", {
+#     # - Default Mac/Win
+#     # - Default Win
+#     Key.RIGHT_ALT:              Key.RIGHT_CTRL,                 # WinMac - Multi-language (Remove)
+#     Key.RIGHT_META:             Key.RIGHT_ALT,                  # WinMac - Multi-language (Remove)
+#     Key.RIGHT_CTRL:             Key.RIGHT_META,                 # WinMac - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_windows and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - Win kbd", {
+#     # - Default Mac/Win
+#     # - Default Win
+#     Key.LEFT_CTRL:              Key.LEFT_META,                  # WinMac
+#     Key.LEFT_META:              Key.LEFT_ALT,                   # WinMac
+#     Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # WinMac
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_windows and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - Mac kbd - multi_lang OFF", {
+#     # - Mac Only
+#     Key.RIGHT_META:             Key.RIGHT_CTRL,                 # Mac - Multi-language (Remove)
+#     Key.RIGHT_CTRL:             Key.RIGHT_META,                 # Mac - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_apple and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+# modmap("Cond modmap - GUI - Mac kbd", {
+#     # - Mac Only
+#     Key.LEFT_CTRL:              Key.LEFT_META,                  # Mac
+#     Key.LEFT_META:              Key.RIGHT_CTRL,                 # Mac
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_apple and
+#     not (ctx_app_is_terminal or ctx_app_is_remote)
+# )
+
+
+# # [Global Terminals conditional modmaps] Change modifier keys in certain applications
+# modmap("Cond modmap - Terms - IBM kbd - multi_lang OFF", {
+#     # - IBM - Multi-language
+#     Key.RIGHT_ALT:              Key.RIGHT_CTRL,                 # IBM - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_ibm and
+#     ctx_app_is_terminal
+# )
+# modmap("Cond modmap - Terms - IBM kbd", {
+#     # - IBM
+#     Key.CAPSLOCK:               Key.LEFT_ALT,                   # IBM
+#     # Left Ctrl stays Left Ctrl
+#     Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # IBM
+#     # Right Meta does not exist on IBM keyboards
+#     Key.RIGHT_CTRL:             Key.RIGHT_ALT,                  # IBM
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_ibm and
+#     ctx_app_is_terminal
+# )
+# modmap("Cond modmap - Terms - Cbk kbd - multi_lang OFF", {
+#     # - Chromebook
+#     Key.RIGHT_ALT:              Key.RIGHT_CTRL,                 # Chromebook - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_chromebook and
+#     ctx_app_is_terminal
+# )
+# modmap("Cond modmap - Terms - Cbk kbd", {
+#     # - Chromebook
+#     # Left Ctrl Stays Left Ctrl
+#     Key.LEFT_META:              Key.LEFT_ALT,                   # Chromebook
+#     Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # Chromebook
+#     # Right Meta does not exist on chromebooks
+#     Key.RIGHT_CTRL:             Key.RIGHT_ALT,                  # Chromebook
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_chromebook and
+#     ctx_app_is_terminal
+# )
+# modmap("Cond modmap - Terms - Win kbd - multi_lang OFF", {
+#     # - Default Mac/Win
+#     # - Default Win
+#     Key.RIGHT_ALT:              Key.RIGHT_CTRL,                 # WinMac - Multi-language (Remove)
+#     Key.RIGHT_META:             Key.RIGHT_ALT,                  # WinMac - Multi-language (Remove)
+#     Key.RIGHT_CTRL:             Key.LEFT_CTRL,                  # WinMac - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_windows and
+#     ctx_app_is_terminal
+# )
+# modmap("Cond modmap - Terms - Win kbd", {
+#     # - Default Mac/Win
+#     # - Default Win
+#     Key.LEFT_CTRL:              Key.LEFT_CTRL,                  # WinMac
+#     Key.LEFT_META:              Key.LEFT_ALT,                   # WinMac
+#     Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # WinMac
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_windows and
+#     ctx_app_is_terminal
+# )
+# modmap("Cond modmap - Terms - Mac kbd - multi_lang OFF", {
+#     # - Mac Only
+#     # Left Ctrl Stays Left Ctrl
+#     Key.RIGHT_META:             Key.RIGHT_CTRL,                 # Mac - Multi-language (Remove)
+#     Key.RIGHT_CTRL:             Key.LEFT_CTRL,                  # Mac - Multi-language (Remove)
+# }, when = lambda ctx:
+#     not cnfg.multi_lang and
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_apple and
+#     ctx_app_is_terminal
+# )
+# modmap("Cond modmap - Terms - Mac kbd", {
+#     # - Mac Only
+#     # Left Ctrl Stays Left Ctrl
+#     Key.LEFT_CTRL:              Key.LEFT_CTRL,                  # Mac (self-modmap)
+#     Key.LEFT_ALT:               Key.LEFT_ALT,                   # Mac (self-modmap)
+#     Key.LEFT_META:              Key.RIGHT_CTRL,                 # Mac
+#     Key.RIGHT_ALT:              Key.RIGHT_ALT,                  # Mac (self-modmap)
+# }, when = lambda ctx:
+#     cnfg.screen_has_focus and
+#     ctx_kbd_is_apple and
+#     ctx_app_is_terminal
+# )
+
+
+# [Super tap passthrough multipurpose modmaps]
+# Place these with the other specialty multipurpose modmaps (Enter2Cmd, Caps2Esc, AltGr-Menu),
+# before the plain modmap sections below. Each pierces the claimed key's normal held mapping with
+# a lone-tap Super event. Off by default. The held mapping for the OFF state lives in the GUI/Terms
+# "<key> held" companions further down; the claimed keys are carved out of the base modmaps so they
+# survive apply_modmap and these multis can fire. Gate: not remote (= GUI + terminals).
+
+multipurpose_modmap("Left Cmd is Sup & Cmd - Mac kbd", {
+    Key.LEFT_META:              [Key.LEFT_META, Key.RIGHT_CTRL],    # tap Super / hold Cmd
+}, when = lambda ctx:
+    cnfg.l_cmd_is_sup_and_cmd and
+    cnfg.screen_has_focus and
+    ctx_kbd_is_apple and
+    not ctx_app_is_remote
+)
+multipurpose_modmap("Left Opt is Sup & Opt - Mac kbd", {
+    Key.LEFT_ALT:               [Key.LEFT_META, Key.LEFT_ALT],      # tap Super / hold Opt
+}, when = lambda ctx:
+    cnfg.l_opt_is_sup_and_opt and
+    cnfg.screen_has_focus and
+    ctx_kbd_is_apple and
+    not ctx_app_is_remote
+)
+multipurpose_modmap("Left Cmd is Sup & Cmd - Win kbd", {
+    Key.LEFT_ALT:               [Key.LEFT_META, Key.RIGHT_CTRL],    # tap Super / hold Cmd
+}, when = lambda ctx:
+    cnfg.l_cmd_is_sup_and_cmd and
+    cnfg.screen_has_focus and
+    ctx_kbd_is_windows and
+    not ctx_app_is_remote
+)
+multipurpose_modmap("Left Opt is Sup & Opt - Win kbd", {
+    Key.LEFT_META:              [Key.LEFT_META, Key.LEFT_ALT],      # tap Super / hold Opt
+}, when = lambda ctx:
+    cnfg.l_opt_is_sup_and_opt and
+    cnfg.screen_has_focus and
+    ctx_kbd_is_windows and
+    not ctx_app_is_remote
+)
 
 
 # [Global GUI conditional modmaps] Change modifier keys as in xmodmap
@@ -2099,9 +2426,24 @@ modmap("Cond modmap - GUI - Win kbd", {
     # - Default Mac/Win
     # - Default Win
     Key.LEFT_CTRL:              Key.LEFT_META,                  # WinMac
-    Key.LEFT_META:              Key.LEFT_ALT,                   # WinMac
-    Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # WinMac
+    # LEFT_ALT (Cmd) and LEFT_META (Opt) handled by the held companions / Super tap multis
 }, when = lambda ctx:
+    cnfg.screen_has_focus and
+    ctx_kbd_is_windows and
+    not ctx_app_is_terminal and not ctx_app_is_remote
+)
+modmap("Cond modmap - GUI - Win kbd - Cmd held", {
+    Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # WinMac - Cmd (held)
+}, when = lambda ctx:
+    not cnfg.l_cmd_is_sup_and_cmd and
+    cnfg.screen_has_focus and
+    ctx_kbd_is_windows and
+    not ctx_app_is_terminal and not ctx_app_is_remote
+)
+modmap("Cond modmap - GUI - Win kbd - Opt held", {
+    Key.LEFT_META:              Key.LEFT_ALT,                   # WinMac - Opt (held)
+}, when = lambda ctx:
+    not cnfg.l_opt_is_sup_and_opt and
     cnfg.screen_has_focus and
     ctx_kbd_is_windows and
     not ctx_app_is_terminal and not ctx_app_is_remote
@@ -2119,8 +2461,16 @@ modmap("Cond modmap - GUI - Mac kbd - multi_lang OFF", {
 modmap("Cond modmap - GUI - Mac kbd", {
     # - Mac Only
     Key.LEFT_CTRL:              Key.LEFT_META,                  # Mac
-    Key.LEFT_META:              Key.RIGHT_CTRL,                 # Mac
+    # LEFT_META (Cmd) handled by the held companion / Super tap multi; LEFT_ALT (Opt) is passthrough
 }, when = lambda ctx:
+    cnfg.screen_has_focus and
+    ctx_kbd_is_apple and
+    not ctx_app_is_terminal and not ctx_app_is_remote
+)
+modmap("Cond modmap - GUI - Mac kbd - Cmd held", {
+    Key.LEFT_META:              Key.RIGHT_CTRL,                 # Mac - Cmd (held)
+}, when = lambda ctx:
+    not cnfg.l_cmd_is_sup_and_cmd and
     cnfg.screen_has_focus and
     ctx_kbd_is_apple and
     not ctx_app_is_terminal and not ctx_app_is_remote
@@ -2186,9 +2536,24 @@ modmap("Cond modmap - Terms - Win kbd", {
     # - Default Mac/Win
     # - Default Win
     Key.LEFT_CTRL:              Key.LEFT_CTRL,                  # WinMac
-    Key.LEFT_META:              Key.LEFT_ALT,                   # WinMac
-    Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # WinMac
+    # LEFT_ALT (Cmd) and LEFT_META (Opt) handled by the held companions / Super tap multis
 }, when = lambda ctx:
+    cnfg.screen_has_focus and
+    ctx_kbd_is_windows and
+    ctx_app_is_terminal
+)
+modmap("Cond modmap - Terms - Win kbd - Cmd held", {
+    Key.LEFT_ALT:               Key.RIGHT_CTRL,                 # WinMac - Cmd (held)
+}, when = lambda ctx:
+    not cnfg.l_cmd_is_sup_and_cmd and
+    cnfg.screen_has_focus and
+    ctx_kbd_is_windows and
+    ctx_app_is_terminal
+)
+modmap("Cond modmap - Terms - Win kbd - Opt held", {
+    Key.LEFT_META:              Key.LEFT_ALT,                   # WinMac - Opt (held)
+}, when = lambda ctx:
+    not cnfg.l_opt_is_sup_and_opt and
     cnfg.screen_has_focus and
     ctx_kbd_is_windows and
     ctx_app_is_terminal
@@ -2208,15 +2573,21 @@ modmap("Cond modmap - Terms - Mac kbd", {
     # - Mac Only
     # Left Ctrl Stays Left Ctrl
     Key.LEFT_CTRL:              Key.LEFT_CTRL,                  # Mac (self-modmap)
-    Key.LEFT_ALT:               Key.LEFT_ALT,                   # Mac (self-modmap)
-    Key.LEFT_META:              Key.RIGHT_CTRL,                 # Mac
     Key.RIGHT_ALT:              Key.RIGHT_ALT,                  # Mac (self-modmap)
+    # LEFT_META (Cmd) handled by the held companion / Super tap multi; LEFT_ALT (Opt) is passthrough
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     ctx_kbd_is_apple and
     ctx_app_is_terminal
 )
-
+modmap("Cond modmap - Terms - Mac kbd - Cmd held", {
+    Key.LEFT_META:              Key.RIGHT_CTRL,                 # Mac - Cmd (held)
+}, when = lambda ctx:
+    not cnfg.l_cmd_is_sup_and_cmd and
+    cnfg.screen_has_focus and
+    ctx_kbd_is_apple and
+    ctx_app_is_terminal
+)
 
 
 # Suggested location for adding custom modmaps for personal use.
@@ -3541,7 +3912,7 @@ keymap("OptSpecialChars - ABC", {
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     cnfg.optspec_layout == 'ABC' and
-    not ctx_app_is_terminal and not ctx_app_is_remote
+    not (ctx_app_is_terminal or ctx_app_is_remote)
 )
 
 
@@ -3692,7 +4063,7 @@ keymap("OptSpecialChars - US", {
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     cnfg.optspec_layout == 'US' and
-    not ctx_app_is_terminal and not ctx_app_is_remote
+    not (ctx_app_is_terminal or ctx_app_is_remote)
 )
 
 
@@ -3755,6 +4126,16 @@ keymap("User hardware keys", {
 #       ctx_app_is_remote
 # )
 
+
+try:
+    setup_level3_combos_via_left_alt(
+        when = lambda ctx:
+            ctx_ovl_level3_left_alt and
+            cnfg.screen_has_focus and
+            not (ctx_app_is_terminal or ctx_app_is_remote)
+    )
+except NameError:
+    pass
 
 
 #################################  MISC APPS  #####################################
@@ -4397,71 +4778,75 @@ keymap("General Web Browsers", {
 hmp_is_jetbrains                = matchProps(clas="^jetbrains-(?!.*toolbox).*$")
 keymap("Jetbrains", {
     # General
-    C("C-Key_0"):               C("Alt-Key_0"),                 # Open corresponding tool window
-    C("C-Key_1"):               C("Alt-Key_1"),                 # Open corresponding tool window
-    C("C-Key_2"):               C("Alt-Key_2"),                 # Open corresponding tool window
-    C("C-Key_3"):               C("Alt-Key_3"),                 # Open corresponding tool window
-    C("C-Key_4"):               C("Alt-Key_4"),                 # Open corresponding tool window
-    C("C-Key_5"):               C("Alt-Key_5"),                 # Open corresponding tool window
-    C("C-Key_6"):               C("Alt-Key_6"),                 # Open corresponding tool window
-    C("C-Key_7"):               C("Alt-Key_7"),                 # Open corresponding tool window
-    C("C-Key_8"):               C("Alt-Key_8"),                 # Open corresponding tool window
-    C("C-Key_9"):               C("Alt-Key_9"),                 # Open corresponding tool window
+    C("RC-Key_0"):              C("Alt-Key_0"),                 # Open corresponding tool window
+    C("RC-Key_1"):              C("Alt-Key_1"),                 # Open corresponding tool window
+    C("RC-Key_2"):              C("Alt-Key_2"),                 # Open corresponding tool window
+    C("RC-Key_3"):              C("Alt-Key_3"),                 # Open corresponding tool window
+    C("RC-Key_4"):              C("Alt-Key_4"),                 # Open corresponding tool window
+    C("RC-Key_5"):              C("Alt-Key_5"),                 # Open corresponding tool window
+    C("RC-Key_6"):              C("Alt-Key_6"),                 # Open corresponding tool window
+    C("RC-Key_7"):              C("Alt-Key_7"),                 # Open corresponding tool window
+    C("RC-Key_8"):              C("Alt-Key_8"),                 # Open corresponding tool window
+    C("RC-Key_9"):              C("Alt-Key_9"),                 # Open corresponding tool window
     C("Super-Grave"):           C("C-Grave"),                   # Quick switch current scheme
-    C("C-Comma"):               C("C-Alt-s"),                   # Open Settings dialog
-    C("C-Semicolon"):           C("C-Alt-Shift-s"),             # Open Project Structure dialog
+    C("RC-Comma"):              C("C-Alt-s"),                   # Open Settings dialog
+    C("RC-Semicolon"):          C("Shift-C-Alt-s"),             # Open Project Structure dialog
     # Debugging
-    C("C-Alt-r"):               C("F9"),                        # Resume program
+    C("Alt-RC-r"):              C("F9"),                        # Resume program
     # Search/Replace
-    C("C-g"):                   C("F3"),                        # Find next
-    C("C-Shift-F3"):            C("Shift-F3"),                  # Find previous
-    C("Super-g"):               C("Alt-j"),                     # Select next occurrence
-    C("C-Super-g"):             C("C-Alt-Shift-j"),             # Select all occurrences
-    C("Super-Shift-g"):         C("Alt-Shift-j"),               # Unselect occurrence
+    C("RC-g"):                  C("F3"),                        # Find next (Mac Cmd+G)
+    C("Shift-RC-g"):            C("Shift-F3"),                  # Find previous (Mac Cmd+Shift+G)
+    C("Super-g"):               C("Alt-j"),                     # Select next occurrence (Mac Ctrl+G)
+    C("Super-RC-g"):            C("Shift-C-Alt-j"),             # Select all occurrences (Mac Cmd+Ctrl+G)
+    C("Shift-Super-g"):         C("Shift-Alt-j"),               # Unselect occurrence (Mac Ctrl+Shift+G)
     # Editing
     # C("Super-Space"):           C("C-Space"),                   # Basic code completion (conflicts with input switching)
-    # C("Super-Shift-Space"):     C("Shift-C-Space"),             # Smart code completion (conflicts with input switching)
-    C("Super-j"):               C("C-q"),                       # Quick documentation lookup
-    C("C-n"):                   C("Alt-Insert"),                # Generate code...
+    # C("Shift-Super-Space"):     C("Shift-C-Space"),             # Smart code completion (conflicts with input switching)
+    C("Super-j"):               C("C-q"),                       # Quick documentation lookup (Mac Ctrl+J, legacy)
+    C("F1"):                    C("C-q"),                       # Quick documentation lookup (Mac F1, current default)
+    C("RC-n"):                  C("Alt-Insert"),                # Generate code...
     C("Super-o"):               C("C-o"),                       # Override methods
     C("Super-i"):               C("C-i"),                       # Implement methods
     C("Alt-Up"):                C("C-w"),                       # Extend selection
-    C("Alt-Down"):              C("C-Shift-w"),                 # Shrink selection
-    C("Super-Shift-q"):         C("Alt-q"),                     # Context info
+    C("Alt-Down"):              C("Shift-C-w"),                 # Shrink selection
+    # TODO: Verify - Mac default keymap docs no longer list Ctrl+Shift+Q for Context Info.
+    #       May be a legacy mapping. Leaving in place pending confirmation from a JetBrains user.
+    C("Shift-Super-q"):         C("Alt-q"),                     # Context info
     C("Super-Alt-o"):           C("C-Alt-o"),                   # Optimize imports
     C("Super-Alt-i"):           C("C-Alt-i"),                   # Auto-indent line(s)
-    C("C-Backspace"):           C("C-y"),                       # Delete line at caret
-    C("Super-Shift-j"):         C("C-Shift-j"),                 # Smart line join
+    C("RC-Backspace"):          C("C-y"),                       # Delete line at caret
+    C("Shift-Super-j"):         C("Shift-C-j"),                 # Smart line join
     C("Alt-Delete"):            C("C-Delete"),                  # Delete to word end
     C("Alt-Backspace"):         C("C-Backspace"),               # Delete to word start
-    C("C-Shift-Equal"):         C("C-KPPLUS"),                  # Expand code block
-    C("C-Minus"):               C("C-KPMINUS"),                 # Collapse code block
-    C("C-Shift-Equal"):         C("C-Shift-KPPLUS"),            # Expand all
-    C("C-Shift-Minus"):         C("C-Shift-KPMINUS"),           # Collapse all
-    C("C-w"):                   C("C-F4"),                      # Close active editor tab
+    C("RC-Equal"):              C("C-KPPLUS"),                  # Expand code block (Mac Cmd+=)
+    C("RC-Minus"):              C("C-KPMINUS"),                 # Collapse code block (Mac Cmd+-)
+    C("Shift-RC-Equal"):        C("Shift-C-KPPLUS"),            # Expand all (Mac Cmd+Shift+=)
+    C("Shift-RC-Minus"):        C("Shift-C-KPMINUS"),           # Collapse all (Mac Cmd+Shift+-)
+    C("RC-w"):                  C("C-F4"),                      # Close active editor tab
     # Refactoring
-    C("C-Delete"):              C("Alt-Delete"),                # Safe Delete
-    C("C-T"):                   C("C-Alt-Shift-t"),             # Refactor this
+    C("RC-Delete"):             C("Alt-Delete"),                # Safe Delete (Mac Cmd+ForwardDelete)
+    C("Super-t"):               C("Shift-C-Alt-t"),             # Refactor This (Mac Ctrl+T)
     # Navigation
-    C("C-o"):                   C("C-n"),                       # Go to class
-    C("C-Shift-o"):             C("C-Shift-n"),                 # Go to file
-    C("C-Alt-o"):               C("C-Alt-Shift-n"),             # Go to symbol
+    C("RC-o"):                  C("C-n"),                       # Go to class
+    C("Shift-RC-o"):            C("Shift-C-n"),                 # Go to file
+    C("Alt-RC-o"):              C("Shift-C-Alt-n"),             # Go to symbol
     C("Super-Right"):           C("Alt-Right"),                 # Go to next editor tab
     C("Super-Left"):            C("Alt-Left"),                  # Go to previous editor tab
-    C("C-l"):                   C("C-g"),                       # Go to line
-    C("Alt-Space"):             C("C-Shift-i"),                 # Open quick definition lookup
-    C("C-Y"):                   C("C-Shift-i"),                 # Open quick definition lookup
-    C("Super-Shift-b"):         C("C-Shift-b"),                 # Go to type declaration
-    C("Super-Up"):              C("Alt-Up"),                    # Go to previous
-    C("Super-Down"):            C("Alt-Down"),                  # Go to next method
-    C("C-Left_Brace"):          C("Alt-Shift-Left"),            # Go back
-    C("C-Right_Brace"):         C("Alt-Shift-Right"),           # Go forward
+    C("RC-l"):                  C("C-g"),                       # Go to line
+    C("Alt-Space"):             C("Shift-C-i"),                 # Open quick definition lookup
+    C("RC-Y"):                  C("Shift-C-i"),                 # Open quick definition lookup
+    # Note: Mac Cmd+Shift+B (Go to Type Declaration) passes through naturally to Linux Ctrl+Shift+B,
+    #       so no explicit remap is needed. The earlier 'Super-Shift-b' input was incorrect (Mac uses Cmd, not Ctrl).
+    C("Shift-Super-Up"):        C("Alt-Up"),                    # Go to previous method (Mac Ctrl+Shift+Up)
+    C("Shift-Super-Down"):      C("Alt-Down"),                  # Go to next method (Mac Ctrl+Shift+Down)
+    C("RC-Left_Brace"):         C("Shift-Alt-Left"),            # Go back
+    C("RC-Right_Brace"):        C("Shift-Alt-Right"),           # Go forward
     C("Super-h"):               C("C-h"),                       # Type hierarchy
     C("Super-Alt-h"):           C("C-Alt-h"),                   # Call hierarchy
-    C("C-Down"):                C("C-Enter"),                   # Edit source/View source
+    C("RC-Down"):               C("C-Enter"),                   # Edit source/View source
     C("Alt-Home"):              C("Alt-Home"),                  # Show navigation bar
-    C("F2"):                    C("F11"),                       # Toggle bookmark
-    C("Super-F3"):              C("C-F11"),                     # Toggle bookmark with mnemonic
+    C("F3"):                    C("F11"),                       # Toggle bookmark (Mac F3)
+    C("Alt-F3"):                C("C-F11"),                     # Toggle bookmark with mnemonic (Mac Alt+F3)
     C("Super-Key_0"):           C("C-Key_0"),                   # Go to numbered bookmark
     C("Super-Key_1"):           C("C-Key_1"),                   # Go to numbered bookmark
     C("Super-Key_2"):           C("C-Key_2"),                   # Go to numbered bookmark
@@ -4472,14 +4857,14 @@ keymap("Jetbrains", {
     C("Super-Key_7"):           C("C-Key_7"),                   # Go to numbered bookmark
     C("Super-Key_8"):           C("C-Key_8"),                   # Go to numbered bookmark
     C("Super-Key_9"):           C("C-Key_9"),                   # Go to numbered bookmark
-    C("C-F3"):                  C("Shift-F11"),                 # Show bookmarks
+    C("RC-F3"):                 C("Shift-F11"),                 # Show bookmarks
     # Compile and Run
-    C("Super-Alt-r"):           C("Alt-Shift-F10"),             # Select configuration and run
-    C("Super-Alt-d"):           C("Alt-Shift-F9"),              # Select configuration and debug
+    C("Super-Alt-r"):           C("Shift-Alt-F10"),             # Select configuration and run
+    C("Super-Alt-d"):           C("Shift-Alt-F9"),              # Select configuration and debug
     C("Super-r"):               C("Shift-F10"),                 # Run
     C("Super-d"):               C("Shift-F9"),                  # Debug
-    C("Super-Shift-r"):         C("C-Shift-F10"),               # Run context configuration from editor
-    C("Super-Shift-d"):         C("C-Shift-F9"),                # Debug context configuration from editor
+    C("Shift-Super-r"):         C("Shift-C-F10"),               # Run context configuration from editor
+    C("Shift-Super-d"):         C("Shift-C-F9"),                # Debug context configuration from editor
     # VCS/Local History
     C("Super-v"):               C("Alt-Grave"),                 # VCS quick popup
     C("Super-c"):               C("C-c"),                       # Sigints - interrupt
@@ -5330,7 +5715,7 @@ keymap("Cmd+Dot not in terminals", {
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     ctx_ovl_macos_globals and
-    not ctx_app_is_terminal and not ctx_app_is_remote
+    not (ctx_app_is_terminal or ctx_app_is_remote)
 )
 
 
@@ -5829,7 +6214,7 @@ keymap("Diagnostics (isMultiTap)", {
                                 C("Enter"), C("Enter")],
                         ),
 
-}, when = lambda _: True is True)
+}, when = lambda _: True)
 
 
 # keymap("Diagnostics (isDoubleTap)", {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = '20260515'                        # CLI option "--version" will print this out.
+__version__ = '20260620'                        # CLI option "--version" will print this out.
 
 import os
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'     # prevent this script from creating cache files
@@ -205,7 +205,7 @@ class InstallerSettings:
         self.systemctl_present      = shutil.which('systemctl') is not None
         self.init_system            = None
 
-        self.pkgs_for_distro        = None
+        self.pkgs_for_distro: 'list[str] | None'    = None
 
         self.priv_elev_cmd          = None
         self.first_priv_elev_done   = False     # For secondary password prompts after timeouts
@@ -235,12 +235,9 @@ class InstallerSettings:
 
         self.keymapper_branch       = 'main'        # new branch when switched to 'xwaykeyz'
         self.keymapper_dev_branch   = 'dev_beta'    # branch to test new keymapper features
-        self.keymapper_cust_branch  = None          # Branch name provided by CLI flag argument
+        self.keymapper_cust_branch  = None          # Ref (branch/tag/commit) from CLI flag arg
 
         self.keymapper_url          = 'https://github.com/RedBearAK/xwaykeyz.git'
-
-        # This was changed to a property method that re-evaluates on each access:
-        # self.keymapper_clone_cmd    = f'git clone -b {self.keymapper_branch} {self.keymapper_url}'
 
         self.input_group            = 'input'
         self.user_name              = pwd.getpwuid(os.getuid()).pw_name
@@ -295,22 +292,22 @@ class InstallerSettings:
 
         return [self.py_interp_path, '-m', 'venv', '--copies', self.venv_path]
 
-    @property
-    def keymapper_clone_cmd(self):
-        # Originally a class instance attribute variable:
-        # self.keymapper_clone_cmd    = f'git clone -b {self.keymapper_branch} {self.keymapper_url}'
+    # @property
+    # def keymapper_clone_cmd(self):
+    #     # Originally a class instance attribute variable:
+    #     # self.keymapper_clone_cmd    = f'git clone -b {self.keymapper_branch} {self.keymapper_url}'
 
-        if self.use_dev_keymapper:
-            if self.keymapper_cust_branch:
-                _km_branch = self.keymapper_cust_branch
-            else:
-                _km_branch = self.keymapper_dev_branch
-        else:
-            _km_branch = self.keymapper_branch
+    #     if self.use_dev_keymapper:
+    #         if self.keymapper_cust_branch:
+    #             _km_branch = self.keymapper_cust_branch
+    #         else:
+    #             _km_branch = self.keymapper_dev_branch
+    #     else:
+    #         _km_branch = self.keymapper_branch
 
-        _clone_cmd = f'git clone -b {_km_branch} {self.keymapper_url}'
-        print(f"Keymapper clone command:\n  {_clone_cmd}")
-        return _clone_cmd
+    #     _clone_cmd = f'git clone -b {_km_branch} {self.keymapper_url}'
+    #     print(f"Keymapper clone command:\n  {_clone_cmd}")
+    #     return _clone_cmd
 
     def detect_elevation_command(self):
         """Detect the appropriate privilege elevation command"""
@@ -1194,6 +1191,7 @@ pkg_groups_map = {
         'python-pygobject-devel',
         'python-setuptools',
         'python-virtualenv',
+        'wayland-devel',
         'zenity',
     ],
 
@@ -1246,7 +1244,7 @@ pkg_groups_map = {
         'git',
         'gobject-introspection-devel',
         'libayatana-appindicator-devel',
-        'libinput-tools',
+        # 'libinput-devel',                 # Not needed for DWT quirks file, toshy-libinput tool
         'libnotify',
         'libxkbcommon-devel',
         'pkgconf',
@@ -1254,6 +1252,7 @@ pkg_groups_map = {
         'python-devel',
         'python-evdev',
         'python-pip',
+        'wayland-devel',
         'zenity',
     ],
 
@@ -1285,6 +1284,7 @@ pkg_groups_map = {
         'python3-pip',
         'python3-tk',
         'python3-venv',
+        'libwayland-dev',
         'zenity',
     ],
 
@@ -1379,6 +1379,7 @@ pkg_groups_map = {
         'systemd-devel',
         'tk',
         'typelib-1_0-AyatanaAppIndicator3-0_1',
+        'wayland-devel',
         'zenity',
     ],
 
@@ -1453,6 +1454,7 @@ pkg_groups_map = {
         'systemd-devel',
         'tk',
         'typelib-1_0-AyatanaAppIndicator3-0_1',
+        'wayland-devel',
         'zenity',
     ],
 
@@ -1503,6 +1505,7 @@ pkg_groups_map = {
         'python3-dbus-devel',
         'python-gobject-devel',
         'systemd-devel',
+        'wayland-devel',
         'zenity',
     ],
 
@@ -1531,6 +1534,7 @@ pkg_groups_map = {
         'systemd-devel',
         'tk',
         'typelib-1_0-AyatanaAppIndicator3-0_1',
+        'wayland-devel',
         'zenity',
     ],
 
@@ -1559,6 +1563,7 @@ pkg_groups_map = {
         'python3-pip',
         'python3-tk',
         'python3-venv',
+        'libwayland-dev',
         'zenity',
     ],
 
@@ -1674,6 +1679,7 @@ pip_pkgs   = [
     # Everything below here is just to make the keymapper (xwaykeyz) install smoother, preventing
     # any terminal output that the user might mistake for an "error".
 
+    "anyascii",                 # Transliterate Unicode to ASCII for non-US layout output fallback
     "appdirs",                  # Get appropriate platform-specific directories for app data/config
     "evdev",                    # Interface with Linux input system for keyboard/mouse event handling
     "hyprpy",                   # Python binding for Hyprland Wayland compositor
@@ -1915,6 +1921,60 @@ class DistroQuirksHandler:
             except subprocess.CalledProcessError as e:
                 error(f"Failed to refresh dnf cache: \n\t{e}")
                 safe_shutdown(1)
+
+    @staticmethod
+    def handle_quirks_Arch():
+        print('Doing prep/checks for Arch-based distros...')
+
+        # Make sure we only handle these quirks in the correct distros
+        if cnfg.DISTRO_ID not in distro_groups_map['arch-based']:
+            error('Arch quirks handler called, but this is not Arch-based?')
+            safe_shutdown(1)
+
+        # The libinput CLI tools (libinput list-devices/debug-events and the
+        # 'libinput-quirks' helper) were split out of the base 'libinput' package
+        # into a separate 'libinput-tools' package around libinput 1.30. On a
+        # lagging Arch derivative (e.g. older Manjaro) that package may not exist
+        # as an install target yet, and a missing target aborts the whole batch
+        # install. Pre-split, those same tools still ship inside 'libinput', which
+        # is already present as a dependency of any graphical session. So we try
+        # to install the separate package on its own first; if it can't be
+        # installed, we drop it and continue. The runtime check in
+        # 'toshy-libinput.sh' is the real backstop that warns loudly if the CLI
+        # tools turn out to be genuinely missing later.
+        libinput_tools_pkg = 'libinput-tools'
+
+        if libinput_tools_pkg not in cnfg.pkgs_for_distro:
+            return
+
+        # Already installed? Leave it in the list; the main run skips installed pkgs.
+        is_installed = subprocess.run(
+            ['pacman', '-Q', libinput_tools_pkg], stdout=DEVNULL, stderr=DEVNULL
+        ).returncode == 0
+        if is_installed:
+            return
+
+        print(f"Attempting to install separate '{libinput_tools_pkg}' package...")
+        cmd_lst = [cnfg.priv_elev_cmd, 'pacman', '-S', '--noconfirm', libinput_tools_pkg]
+        result = subprocess.run(cmd_lst, stdout=DEVNULL, stderr=DEVNULL)
+
+        if result.returncode == 0:
+            # Installed cleanly; main run excludes it via the installed-pkg check.
+            print(f"Installed '{libinput_tools_pkg}' successfully.")
+            return
+
+        # Could not install it — most likely not packaged yet on a lagging distro.
+        # Drop it so the main batch install does not abort on a missing target.
+        cnfg.pkgs_for_distro.remove(libinput_tools_pkg)
+        print()
+        print(fancy_str(
+            f"  WARNING: Could not install '{libinput_tools_pkg}' — continuing without it.  ",
+            'red', bold=True))
+        print("  This package may not exist yet on a lagging Arch-based distro. The libinput")
+        print("  CLI tools ship inside the base 'libinput' package on such systems (already")
+        print("  present as a dependency). The Toshy libinput script will warn you later if")
+        print("  the tools turn out to be genuinely missing. Continuing the install...")
+        print()
 
     @staticmethod
     def handle_quirks_CentOS_7():
@@ -2735,6 +2795,9 @@ class PackageInstallDispatcher:
         native_pkg_installer.check_for_pkg_mgr_cmd('pacman')
         call_attn_to_pwd_prompt_if_needed()
 
+        # Resolve the libinput-tools / libinput package split before the batch install
+        DistroQuirksHandler.handle_quirks_Arch()
+
         def is_pkg_installed_pacman(package):
             """utility function to help avoid 'reinstalling' existing packages on Arch"""
             result = subprocess.run(['pacman', '-Q', package], stdout=DEVNULL, stderr=DEVNULL)
@@ -3495,9 +3558,34 @@ def verify_user_groups():
     show_task_completed_msg()
 
 
+# def clone_keymapper_branch():
+#     """Clone the designated keymapper branch from GitHub"""
+#     print(f'\n\n§  Cloning keymapper branch...\n{cnfg.separator}')
+
+#     # Check if `git` command exists. If not, exit script with error.
+#     has_git = shutil.which('git')
+#     if not has_git:
+#         print(f'ERROR: "git" is not installed, for some reason. Cannot continue.')
+#         safe_shutdown(1)
+
+#     if os.path.exists(cnfg.keymapper_tmp_path):
+#         # force a fresh copy of keymapper every time script is run
+#         try:
+#             shutil.rmtree(cnfg.keymapper_tmp_path)
+#         except (OSError, PermissionError, FileNotFoundError) as file_err:
+#             error(f"Problem removing existing '{cnfg.keymapper_tmp_path}' folder:\n\t{file_err}")
+#     try:
+#         subprocess.run(cnfg.keymapper_clone_cmd.split() + [cnfg.keymapper_tmp_path], check=True)
+#     except subprocess.CalledProcessError as proc_err:
+#         print()
+#         error(f'Problem while cloning keymapper branch from GitHub:\n\t{proc_err}')
+#         safe_shutdown(1)
+#     show_task_completed_msg()
+
+
 def clone_keymapper_branch():
-    """Clone the designated keymapper branch from GitHub"""
-    print(f'\n\n§  Cloning keymapper branch...\n{cnfg.separator}')
+    """Clone the keymapper repo and check out the designated ref (branch/tag/commit)"""
+    print(f'\n\n§  Cloning keymapper repo...\n{cnfg.separator}')
 
     # Check if `git` command exists. If not, exit script with error.
     has_git = shutil.which('git')
@@ -3511,12 +3599,41 @@ def clone_keymapper_branch():
             shutil.rmtree(cnfg.keymapper_tmp_path)
         except (OSError, PermissionError, FileNotFoundError) as file_err:
             error(f"Problem removing existing '{cnfg.keymapper_tmp_path}' folder:\n\t{file_err}")
+
+    # Resolve which ref to check out. Default is the stable branch. The
+    # '--dev-keymapper' flag selects the dev branch, or any ref (branch,
+    # tag, or commit SHA) when given an explicit value.
+    if cnfg.use_dev_keymapper:
+        if cnfg.keymapper_cust_branch:
+            _km_ref = cnfg.keymapper_cust_branch
+        else:
+            _km_ref = cnfg.keymapper_dev_branch
+    else:
+        _km_ref = cnfg.keymapper_branch
+
+    # Full clone (no '-b'), so any commit in history is reachable for the
+    # checkout. A SHA cannot be supplied to 'git clone -b', and bisect-style
+    # installs need the full history present.
+    _clone_cmd_lst = ['git', 'clone', cnfg.keymapper_url, cnfg.keymapper_tmp_path]
+    print(f"Keymapper clone command:\n  {' '.join(_clone_cmd_lst)}")
     try:
-        subprocess.run(cnfg.keymapper_clone_cmd.split() + [cnfg.keymapper_tmp_path], check=True)
+        subprocess.run(_clone_cmd_lst, check=True)
     except subprocess.CalledProcessError as proc_err:
         print()
-        error(f'Problem while cloning keymapper branch from GitHub:\n\t{proc_err}')
+        error(f'Problem while cloning keymapper repo from GitHub:\n\t{proc_err}')
         safe_shutdown(1)
+
+    # Check out the resolved ref. Passed as a list element (never split), so a
+    # ref containing quotes/spaces survives intact.
+    _checkout_cmd_lst = ['git', 'checkout', _km_ref]
+    print(f"Keymapper checkout command:\n  git checkout {_km_ref}")
+    try:
+        subprocess.run(_checkout_cmd_lst, cwd=cnfg.keymapper_tmp_path, check=True)
+    except subprocess.CalledProcessError as proc_err:
+        print()
+        error(f"Problem checking out keymapper ref '{_km_ref}':\n\t{proc_err}")
+        safe_shutdown(1)
+
     show_task_completed_msg()
 
 
@@ -3744,8 +3861,10 @@ def install_toshy_files():
                 'LICENSE',
                 'packages.json',
                 'prep_centos_before_setup.sh',
+                'pyrightconfig.json',
                 'README.md',
                 'requirements.txt',
+                'ruff.toml',
                 this_file_name,
         ]
         # must use list unpacking (*) ignore_patterns() requires individual pattern arguments
@@ -5406,9 +5525,9 @@ def main():
         nargs='?',          # Makes the argument optional
         const=True,         # Value if flag is present but no branch specified
         default=False,
-        metavar='BRANCH',
+        metavar='REF',
         help='Install the development branch of the keymapper. '
-                'Optionally specify a custom branch name.'
+                'Optionally specify a branch, tag, or commit SHA.'
     )
     subparser_install.add_argument(
         '--fancy-pants',
