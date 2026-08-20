@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = '20260804'                        # CLI option "--version" will print this out.
+__version__ = '20260820'                        # CLI option "--version" will print this out.
 
 import os
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'     # prevent this script from creating cache files
@@ -5744,7 +5744,34 @@ def install_coding_font():
                 final_folder_name = list(top_dirs)[0]
 
             os.makedirs(extract_dir, exist_ok=True)
-            zip_ref.extractall(extract_dir)
+
+            # Never extract directly onto existing font files. Running apps
+            # (Konsole, etc.) mmap active font files, and truncate-and-rewrite
+            # of the same inode makes them read garbage or take a SIGBUS.
+            # Extract into a hidden temp dir INSIDE the fonts tree (same
+            # filesystem, so rename is atomic; leading dot hides partial
+            # files from fontconfig), then os.replace() each file into place.
+            # The old inode survives for any process still mapping it.
+            tmp_extract_dir = tempfile.mkdtemp(
+                dir=local_fonts_dir, prefix='.toshy_font_tmp_')
+
+            try:
+                zip_ref.extractall(tmp_extract_dir)
+
+                for walk_root, _walk_dirs, walk_files in os.walk(tmp_extract_dir):
+                    rel_dir     = os.path.relpath(walk_root, tmp_extract_dir)
+                    dest_dir    = os.path.normpath(os.path.join(extract_dir, rel_dir))
+                    os.makedirs(dest_dir, exist_ok=True)
+                    for file_name in walk_files:
+                        # os.replace() is an atomic rename on the same
+                        # filesystem and raises OSError (EXDEV) rather than
+                        # silently degrading to copy+delete like shutil.move().
+                        os.replace(
+                            os.path.join(walk_root, file_name),
+                            os.path.join(dest_dir, file_name)
+                        )
+            finally:
+                shutil.rmtree(tmp_extract_dir, ignore_errors=True)
 
     except zipfile.BadZipFile as zip_err:
         error(f"\nERROR: Could not read the font archive: {zip_err}. Skipping font install.")
@@ -5763,6 +5790,8 @@ def install_coding_font():
 
     final_folder_path = os.path.join(extract_dir, final_folder_name)
     print(f"Installed font into location:\n  '{final_folder_path}'")
+    print(  "If font files were updated, running apps keep using the old version.\n"
+            "  Restart terminals/browsers to pick up the new font files.")
 
 
 def _show_cinnamon_menu_hotkey_reminder():
