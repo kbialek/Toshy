@@ -30,6 +30,10 @@ I don't really know many other places where it might be considered appropriate t
 
 # Current status: Stable Beta (Please Read)
 
+**2026-07-31 UPDATE**: Added support for Alpine Linux.
+
+**2026-07-30 UPDATE**: Added functional NixOS support. Not yet applicable to SteamOS or Steam Deck devices. 
+
 **2026-06-20 UPDATE**: Added full symbolic output correction (when possible on the layout). The second phase additions to the previous update which allowed shortcuts to operate from the correct physical position, and output shortcuts to be corrected for the layout. Symbolic correction allows macro text to come out correctly on other Latin-character non-US keyboard layouts.
 
 **2026-06-15 UPDATE**: Added basic Non-US keyboard layout correction capability (off by default, working in most common desktop environments), optional bare Meta/Super tap passthru on Option or Cmd positions (off by default), Alt_Gr on PC laptop context menu keys (on by default), Level3 Shift from left-side Option position (enabled by default, controlled by overlay flag), hardware quirk handling for T2 Mac Touch Bar Fn key (in keymapper), full touchpad support in suspend/resume logic (in keymapper).
@@ -78,7 +82,7 @@ For new updates on the performance advancements, check the dedicated [Wiki page]
 
     [Keyboard Type Not Correct](https://github.com/RedBearAK/toshy/wiki/FAQ-(Frequently-Asked-Questions)#my-keyboard-is-not-recognized-as-the-correct-type)  
 
-- **INTERNATIONAL KEYBOARD USERS**: The keymapper is evdev-based and has **_no idea_** what keyboard layout you are using. It only sees "key codes", not the symbols on the keys. So if it encounters a combo of key _codes_ you've asked it to remap to something else, it will remap it. This is a problem if for instance you're on an AZERTY keyboard where `A` and `Q` are swapped, and you think you're pressing `Cmd+A` but the keymapper thinks you want to remap `Cmd+Q` to `Alt+F4`. I'm looking into a way to get the keymapper to use the proper layout, but in the meantime, depending on how different your layout is from the standard US layout, this keymapper may either be unusable or may just need some small tweaks to the key definition file to fix a few key positions. Open an issue if you have this kind of problem.  
+- **INTERNATIONAL KEYBOARD USERS**: The keymapper is evdev-based and has **_no idea_** what keyboard layout you are using. It only sees "key codes", not the symbols on the keys. So if it encounters a combo of key _codes_ you've asked it to remap to something else, it will remap it. This is a problem if for instance you're on an AZERTY keyboard where `A` and `Q` are swapped, and you think you're pressing `Cmd+A` but the keymapper thinks you want to remap `Cmd+Q` to `Alt+F4`. Toshy now has the ability to detect your active keyboard layout and give the keymapper a correction map to fix these issues. The default config file shows how to enable the layout correction features.  
 
 - **DISTRO SUPPORT**: Toshy will have issues installing on distros not on the [list of supported distros](https://github.com/RedBearAK/toshy/wiki/Supported-Linux-distros) in the Wiki. If you think your distro is closely related to one on the supported list, try the `./setup_toshy.py list-distros` command, and then use one of the distro names with the `--override-distro` option added to the `./setup_toshy.py install` command. See the [**How to Install**](#how-to-install) section.  
 
@@ -463,6 +467,7 @@ You will find these distro groupings in the Wiki article:
 
 - ### Wayland sessions
 
+    - **Budgie 10.1 or later** - _[via `wlroots` method for `labwc`]_
     - **Cinnamon 6.0 or later** - _[uses custom shell extension]_
     - **COSMIC desktop environment** - _[uses D-Bus service]_
     - **GNOME 3.38, and 40 or later** - _[needs shell extension, see [**Requirements**](#requirements)]_
@@ -570,6 +575,7 @@ Toshy does its best to set itself up automatically on any Linux system that uses
 - `emerge`
 - `eopkg`
 - `moss`
+- `nix` (NixOS has its own install path via flake and nix subfolder scripts)
 - `pacman`
 - `rpm-ostree`
 - `transactional-update`
@@ -620,7 +626,7 @@ toshy-systemd-remove    (stops and removes the systemd service units)
 toshy-systemd-setup     (installs and starts the systemd service units)
 ```
 
-The following commands are also available, and meant to allow manually running just the Toshy config file, without any reliance on `systemd`. These will automatically stop the `systemd` services so there is no conflict, for instance if you need to run the `-debug` or `-verbose-start` version of the command (same thing) to debug a shortcut that is not working as expected, or find out how you broke the config file.  
+The following commands are also available, and meant to allow manually running just the Toshy config file, without any reliance on `systemd`. These will automatically stop the `systemd` services so there is no conflict, for instance if you need to run the `toshy-debug` command to debug a shortcut that is not working as expected, or find out how you broke the config file.  
 
 Restarting the Toshy services, either with one of the above commands or from the GUI preferences app or tray icon menu, will stop any manual config process and return to running the Toshy config as a `systemd` service. All the commands are designed to work together as conveniently as possible.  
 
@@ -631,9 +637,13 @@ toshy-config-stop
 ```
 
 ```
-toshy-debug                 (newer alias of 'toshy-config-start-verbose')
-toshy-config-verbose-start  (older alias of 'toshy-config-start-verbose')
-toshy-config-start-verbose  (show debugging output in the terminal)
+toshy-debug                 (show verbose debugging output in the terminal)
+```
+
+To check what a specific key is doing, without wading through the full verbose log output, there is a simpler interactive diagnostic screen. It shows the "real" identity of the last key released, along with what the key was remapped to (if anything), and which modmap was responsible. Multi-purpose keys like the `CapsLock` key (depending on preferences) will show both potential identities, and how the key press was resolved (quick tap, hold timeout, or pressing a second key while holding). Like `toshy-debug`, this stops the Toshy services, which need to be restarted after exiting the diagnostic screen with `Ctrl+C`.  
+
+```
+toshy-keycheck              (interactively show key identities/remaps)
 ```
 
 There are some informative commands that will print different kinds of useful output. These commands may be helpful when troubleshooting or making reports:  

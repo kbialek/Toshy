@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-__version__ = '20260614'
+__version__ = '20260805'
 
 # Indicator tray icon menu app for Toshy, using pygobject/gi
 TOSHY_PART      = 'tray'   # CUSTOMIZE TO SPECIFIC TOSHY COMPONENT! (gui, tray, config)
@@ -58,6 +58,7 @@ from toshy_common import logger
 from toshy_common.logger import *
 from toshy_common.env_context import EnvironmentInfo
 from toshy_common.settings_class import Settings
+from toshy_common.modifier_modes import CAPSLOCK_MODES, CAPSLOCK_MODE_LABELS
 from toshy_common.process_manager import ProcessManager
 from toshy_common.service_manager import ServiceManager
 from toshy_common.monitoring import SettingsMonitor, ServiceMonitor
@@ -67,7 +68,6 @@ process_mgr = None
 
 logger.FLUSH        = True
 logger.VERBOSE      = False
-
 
 
 ###############################################################################
@@ -132,7 +132,6 @@ def check_environment():
 check_environment()
 
 
-
 # =============================================================================
 # ENVIRONMENT-SPECIFIC ADJUSTMENTS
 # =============================================================================
@@ -164,8 +163,31 @@ def show_cinnamon_wayland_warning():
         error("Cinnamon Wayland has known bugs affecting tray icon menus (zenity not available).")
 
 
-# Cinnamon Wayland: Show warning about known tray menu bugs
-if DESKTOP_ENV == 'cinnamon' and SESSION_TYPE == 'wayland':
+def cinnamon_version_below(threshold_tup) -> bool:
+    """Compare the running Cinnamon version (from 'cinnamon --version',
+    e.g. 'Cinnamon 6.6.9') against a (major, minor) threshold. Returns
+    True when the version is known and BELOW the threshold; also returns
+    True when the version cannot be determined, so version-gated warnings
+    err toward still showing."""
+    try:
+        proc = subprocess.run(['cinnamon', '--version'],
+                                capture_output=True, text=True, timeout=5)
+        version_str = proc.stdout.strip().split()[-1]
+        parts_lst = version_str.split('.')
+        version_tup = (int(parts_lst[0]), int(parts_lst[1]))
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return True     # unknown version: keep showing the warning
+    return version_tup < threshold_tup
+
+
+# Cinnamon Wayland: Show warning about known tray menu bugs.
+# Cinnamon 6.8 ships the Wayland popup mapping fixes ("Proper mapping
+# (sizing and positioning) for new windows, applet popup menus and
+# context menus" -- Mint blog, next release scheduled around Christmas
+# 2026), so the warning is gated to versions below 6.8. If the fix turns
+# out incomplete, lower/adjust the threshold or remove the gate.
+if (DESKTOP_ENV == 'cinnamon' and SESSION_TYPE == 'wayland'
+        and cinnamon_version_below((6, 8))):
     show_cinnamon_wayland_warning()
 
 
@@ -196,7 +218,7 @@ user_sysctl     = f'{sysctl_cmd} --user'
 
 # -------- CREATE MENU --------------------------------------------------------
 
-menu = Gtk.Menu()
+main_menu = Gtk.Menu()
 # Add menu items here using Gtk.MenuItem and Gtk.ImageMenuItem
 
 tray_indicator = AppIndicator3.Indicator.new(
@@ -204,9 +226,8 @@ tray_indicator = AppIndicator3.Indicator.new(
     icon_name=icon_file_grayscale,
     category=AppIndicator3.IndicatorCategory.APPLICATION_STATUS)
 tray_indicator.set_status(AppIndicator3.IndicatorStatus.ACTIVE)
-tray_indicator.set_menu(menu)
+tray_indicator.set_menu(main_menu)
 tray_indicator.set_title("Toshy Status Indicator") # try to set what might show in tooltip
-
 
 
 # -------- MENU ACTION FUNCTIONS ----------------------------------------------
@@ -256,7 +277,6 @@ def fn_show_services_log(widget):
         ntfy.send_notification(_ntfy_msg, _ntfy_icon_file)
 
 
-
 def fn_remove_tray_icon(widget):
     global loop
     process_mgr.remove_lockfile()
@@ -282,21 +302,20 @@ def set_item_active_thread_safe(menu_item, state=True):
         GLib.idle_add(do_set_active)
 
 
-
 # -------- MENU ITEMS --------------------------------------------------
 
 if runtime.is_systemd:
     services_label_item = Gtk.MenuItem(label=" ---- Services Status ---- ")
     services_label_item.set_sensitive(False)
-    menu.append(services_label_item)
+    main_menu.append(services_label_item)
 
     toshy_config_status_item = Gtk.MenuItem(    label="      Config: (?)")
     toshy_config_status_item.set_sensitive(False)
-    menu.append(toshy_config_status_item)
+    main_menu.append(toshy_config_status_item)
 
     session_monitor_status_item = Gtk.MenuItem( label="     SessMon: (?)")
     session_monitor_status_item.set_sensitive(False)
-    menu.append(session_monitor_status_item)
+    main_menu.append(session_monitor_status_item)
 
 
 def is_service_enabled(service_name):
@@ -346,33 +365,33 @@ def fn_toggle_toshy_svcs_autostart(widget):
 if runtime.is_systemd:
 
     separator_above_svcs_item = Gtk.SeparatorMenuItem()
-    menu.append(separator_above_svcs_item)  #-------------------------------------#
+    main_menu.append(separator_above_svcs_item)  #-------------------------------------#
 
     restart_toshy_svcs_item = Gtk.MenuItem(label="Re/Start Toshy Services")
     # restart_toshy_svcs_item.connect("activate", fn_restart_toshy_services)
     restart_toshy_svcs_item.connect("activate", lambda widget: service_manager.restart_services())
-    menu.append(restart_toshy_svcs_item)
+    main_menu.append(restart_toshy_svcs_item)
 
     quit_toshy_svcs_item = Gtk.MenuItem(label="Stop Toshy Services")
     # quit_toshy_svcs_item.connect("activate", fn_stop_toshy_services)
     quit_toshy_svcs_item.connect("activate", lambda widget: service_manager.stop_services())
-    menu.append(quit_toshy_svcs_item)
+    main_menu.append(quit_toshy_svcs_item)
 
     separator_below_svcs_item = Gtk.SeparatorMenuItem()
-    menu.append(separator_below_svcs_item)  #-------------------------------------#
+    main_menu.append(separator_below_svcs_item)  #-------------------------------------#
 
 restart_toshy_script_item = Gtk.MenuItem(label="Re/Start Config-Only")
 # restart_toshy_script_item.connect("activate", fn_restart_toshy_config_only)
 restart_toshy_script_item.connect("activate", lambda widget: service_manager.restart_config_only())
-menu.append(restart_toshy_script_item)
+main_menu.append(restart_toshy_script_item)
 
 stop_toshy_script_item = Gtk.MenuItem(label="Stop Config-Only")
 # stop_toshy_script_item.connect("activate", fn_stop_toshy_config_only)
 stop_toshy_script_item.connect("activate", lambda widget: service_manager.stop_config_only())
-menu.append(stop_toshy_script_item)
+main_menu.append(stop_toshy_script_item)
 
 separator_below_script_item = Gtk.SeparatorMenuItem()
-menu.append(separator_below_script_item)  #-------------------------------------#
+main_menu.append(separator_below_script_item)  #-------------------------------------#
 
 if not runtime.barebones_config:
 
@@ -383,23 +402,33 @@ if not runtime.barebones_config:
         set_item_active_thread_safe(media_arrows_fix_item, cnfg.media_arrows_fix)
         set_item_active_thread_safe(multi_lang_item, cnfg.multi_lang)
         set_item_active_thread_safe(ST3_in_VSCode_item, cnfg.ST3_in_VSCode)
-        set_item_active_thread_safe(Caps2Cmd_item, cnfg.Caps2Cmd)
-        set_item_active_thread_safe(Caps2Esc_Cmd_item, cnfg.Caps2Esc_Cmd)
         set_item_active_thread_safe(Enter2Ent_Cmd_item, cnfg.Enter2Ent_Cmd)
         set_item_active_thread_safe(l_cmd_is_sup_and_cmd_item, cnfg.l_cmd_is_sup_and_cmd)
         set_item_active_thread_safe(l_opt_is_sup_and_opt_item, cnfg.l_opt_is_sup_and_opt)
+        set_item_active_thread_safe(swap_spotlight_item, cnfg.swap_spotlight_and_input)
 
     def save_prefs_settings(widget):
-        cnfg.forced_numpad          = forced_numpad_item.get_active()
-        cnfg.altgr_on_menu_key      = altgr_on_menu_key_item.get_active()
-        cnfg.media_arrows_fix       = media_arrows_fix_item.get_active()
-        cnfg.multi_lang             = multi_lang_item.get_active()
-        cnfg.ST3_in_VSCode          = ST3_in_VSCode_item.get_active()
-        cnfg.Caps2Cmd               = Caps2Cmd_item.get_active()
-        cnfg.Caps2Esc_Cmd           = Caps2Esc_Cmd_item.get_active()
-        cnfg.Enter2Ent_Cmd          = Enter2Ent_Cmd_item.get_active()
-        cnfg.l_cmd_is_sup_and_cmd   = l_cmd_is_sup_and_cmd_item.get_active()
-        cnfg.l_opt_is_sup_and_opt   = l_opt_is_sup_and_opt_item.get_active()
+        new_values_dct = {
+            'forced_numpad':        forced_numpad_item.get_active(),
+            'altgr_on_menu_key':    altgr_on_menu_key_item.get_active(),
+            'media_arrows_fix':     media_arrows_fix_item.get_active(),
+            'multi_lang':           multi_lang_item.get_active(),
+            'ST3_in_VSCode':        ST3_in_VSCode_item.get_active(),
+            'Enter2Ent_Cmd':        Enter2Ent_Cmd_item.get_active(),
+            'l_cmd_is_sup_and_cmd': l_cmd_is_sup_and_cmd_item.get_active(),
+            'l_opt_is_sup_and_opt': l_opt_is_sup_and_opt_item.get_active(),
+            'swap_spotlight_and_input': swap_spotlight_item.get_active(),
+        }
+
+        # No-change guard: programmatic updates (settings monitor echoes)
+        # re-fire 'toggled' after cnfg already holds the values; saving
+        # again would rewrite the DB and double the settings emission in
+        # the config's verbose log.
+        if all(getattr(cnfg, key) == value for key, value in new_values_dct.items()):
+            return
+
+        for key, value in new_values_dct.items():
+            setattr(cnfg, key, value)
 
         cnfg.save_settings()
         GLib.idle_add(load_prefs_submenu_settings)  # Queue the update to run in GTK's main loop
@@ -410,7 +439,7 @@ if not runtime.barebones_config:
     prefs_submenu = Gtk.Menu()
     prefs_submenu_item = Gtk.MenuItem(label="Preferences")
     prefs_submenu_item.set_submenu(prefs_submenu)
-    menu.append(prefs_submenu_item)
+    main_menu.append(prefs_submenu_item)
 
     altgr_on_menu_key_item = Gtk.CheckMenuItem(label='Alt_Gr on Menu key')
     altgr_on_menu_key_item.set_active(cnfg.altgr_on_menu_key)
@@ -422,25 +451,10 @@ if not runtime.barebones_config:
     multi_lang_item.connect('toggled', save_prefs_settings)
     prefs_submenu.append(multi_lang_item)
 
-    Caps2Cmd_item = Gtk.CheckMenuItem(label='CapsLock is Cmd')
-    Caps2Cmd_item.set_active(cnfg.Caps2Cmd)
-    Caps2Cmd_item.connect('toggled', save_prefs_settings)
-    prefs_submenu.append(Caps2Cmd_item)
-
-    Caps2Esc_Cmd_item = Gtk.CheckMenuItem(label='CapsLock is Esc & Cmd')
-    Caps2Esc_Cmd_item.set_active(cnfg.Caps2Esc_Cmd)
-    Caps2Esc_Cmd_item.connect('toggled', save_prefs_settings)
-    prefs_submenu.append(Caps2Esc_Cmd_item)
-
     Enter2Ent_Cmd_item = Gtk.CheckMenuItem(label='Enter is Enter & Cmd')
     Enter2Ent_Cmd_item.set_active(cnfg.Enter2Ent_Cmd)
     Enter2Ent_Cmd_item.connect('toggled', save_prefs_settings)
     prefs_submenu.append(Enter2Ent_Cmd_item)
-
-    ST3_in_VSCode_item = Gtk.CheckMenuItem(label='Sublime3 in VSCode')
-    ST3_in_VSCode_item.set_active(cnfg.ST3_in_VSCode)
-    ST3_in_VSCode_item.connect('toggled', save_prefs_settings)
-    prefs_submenu.append(ST3_in_VSCode_item)
 
     forced_numpad_item = Gtk.CheckMenuItem(label='Forced Numpad')
     forced_numpad_item.set_active(cnfg.forced_numpad)
@@ -451,6 +465,16 @@ if not runtime.barebones_config:
     media_arrows_fix_item.set_active(cnfg.media_arrows_fix)
     media_arrows_fix_item.connect('toggled', save_prefs_settings)
     prefs_submenu.append(media_arrows_fix_item)
+
+    ST3_in_VSCode_item = Gtk.CheckMenuItem(label='Sublime3 in VSCode')
+    ST3_in_VSCode_item.set_active(cnfg.ST3_in_VSCode)
+    ST3_in_VSCode_item.connect('toggled', save_prefs_settings)
+    prefs_submenu.append(ST3_in_VSCode_item)
+
+    swap_spotlight_item = Gtk.CheckMenuItem(label='Swap Spotlight & Input Switch')
+    swap_spotlight_item.set_active(cnfg.swap_spotlight_and_input)
+    swap_spotlight_item.connect('toggled', save_prefs_settings)
+    prefs_submenu.append(swap_spotlight_item)
 
     prefs_submenu.append(Gtk.SeparatorMenuItem())
 
@@ -473,6 +497,54 @@ if not runtime.barebones_config:
 
 
     ###############################################################
+    # CapsLock submenu
+    #
+    # Radio button items for all the available CapsLock modes
+
+    def load_capslock_mode_submenu_settings():
+        cnfg.load_settings()
+        active_item = capslock_mode_items_dct.get(cnfg.capslock_mode)
+        if active_item:
+            set_item_active_thread_safe(active_item, True)
+
+    def save_capslock_mode_setting(menu_item, mode):
+        if not menu_item.get_active():
+            return
+
+        # Programmatic updates (settings monitor echoes, startup load) re-fire
+        # 'toggled'; cnfg has already auto-reloaded by then, so a no-change
+        # save here would just write the DB again and double the settings
+        # emission in the config's verbose log.
+        if cnfg.capslock_mode == mode:
+            return
+
+        cnfg.capslock_mode = mode
+        cnfg.save_settings()
+        load_capslock_mode_submenu_settings()
+
+    # CapsLock Mode radio submenu (replaces legacy Caps2Cmd/Caps2Esc_Cmd toggles).
+    # Items built from the canonical mode tuple; radio group provides exclusivity.
+    capslock_mode_submenu = Gtk.Menu()
+    capslock_mode_submenu_item = Gtk.MenuItem(label='CapsLock Mode')
+    capslock_mode_submenu_item.set_submenu(capslock_mode_submenu)
+    main_menu.append(capslock_mode_submenu_item)
+
+    capslock_mode_items_dct = {}
+    group_capslock_mode = None
+    for caps_mode in CAPSLOCK_MODES:
+        mode_label = CAPSLOCK_MODE_LABELS.get(caps_mode, caps_mode)
+        mode_item = Gtk.RadioMenuItem.new_with_label(group_capslock_mode, mode_label)
+        mode_item.connect('toggled', save_capslock_mode_setting, caps_mode)
+        capslock_mode_submenu.append(mode_item)
+        capslock_mode_items_dct[caps_mode] = mode_item
+        if group_capslock_mode is None:
+            group_capslock_mode = mode_item.get_group()
+
+    # End of CapsLock submenu
+    ###############################################################
+
+
+    ###############################################################
     # Overlays submenu
     #
     # Built dynamically from OVL_METADATA so that adding a new overlay
@@ -487,14 +559,24 @@ if not runtime.barebones_config:
     def save_overlay_setting(widget, flag):
         """Toggle a single overlay flag bit and save to settings."""
         if widget.get_active():
-            cnfg.overlay_mask = cnfg.overlay_mask | flag
+            new_mask = cnfg.overlay_mask | flag
         else:
-            cnfg.overlay_mask = cnfg.overlay_mask & ~flag
+            new_mask = cnfg.overlay_mask & ~flag
+
+        # No-change guard: see save_prefs_settings.
+        if new_mask == cnfg.overlay_mask:
+            return
+
+        cnfg.overlay_mask = new_mask
         cnfg.save_settings()
         GLib.idle_add(load_overlay_submenu_settings)
 
     def apply_overlay_preset(widget, preset_value):
         """Replace the entire overlay mask with a preset value."""
+        # No-change guard: see save_prefs_settings.
+        if cnfg.overlay_mask == preset_value:
+            return
+
         cnfg.overlay_mask = preset_value
         cnfg.save_settings()
         GLib.idle_add(load_overlay_submenu_settings)
@@ -516,7 +598,7 @@ if not runtime.barebones_config:
     overlays_submenu = Gtk.Menu()
     overlays_submenu_item = Gtk.MenuItem(label="Overlays")
     overlays_submenu_item.set_submenu(overlays_submenu)
-    menu.append(overlays_submenu_item)
+    main_menu.append(overlays_submenu_item)
 
     # ─── Preset items at top of submenu ───
     # One-click switches that replace the entire mask. Not radio items —
@@ -565,7 +647,14 @@ if not runtime.barebones_config:
     def save_optspec_layout_setting(menu_item, layout):
         if not menu_item.get_active():
             return
-        
+
+        # No-change guard: programmatic updates (startup load, settings
+        # monitor echoes) re-fire 'toggled' after cnfg already holds the
+        # value; saving again would rewrite the DB and double the settings
+        # emission in the config's verbose log.
+        if cnfg.optspec_layout == layout:
+            return
+
         cnfg.optspec_layout = layout
         cnfg.save_settings()
         load_optspec_layout_submenu_settings()
@@ -574,7 +663,7 @@ if not runtime.barebones_config:
     optspec_layout_submenu = Gtk.Menu()
     optspec_layout_item = Gtk.MenuItem(label='OptSpec Layout')
     optspec_layout_item.set_submenu(optspec_layout_submenu)
-    menu.append(optspec_layout_item)
+    main_menu.append(optspec_layout_item)
 
     # Create submenu items using RadioMenuItem
     group_optspec = None
@@ -604,7 +693,12 @@ if not runtime.barebones_config:
     def save_kbtype_setting(menu_item, kbtype):
         if not menu_item.get_active():
             return
-        
+
+        # No-change guard: also prevents the critical notification below
+        # from re-firing on startup load or settings monitor echoes.
+        if cnfg.override_kbtype == kbtype:
+            return
+
         cnfg.override_kbtype = kbtype
         cnfg.save_settings()
 
@@ -621,7 +715,7 @@ if not runtime.barebones_config:
     kbtype_submenu = Gtk.Menu()
     kbtype_item = Gtk.MenuItem(label='Keyboard Type')
     kbtype_item.set_submenu(kbtype_submenu)
-    menu.append(kbtype_item)
+    main_menu.append(kbtype_item)
 
     # create submenu items using RadioMenuItem
     group_kbtype = None
@@ -647,23 +741,32 @@ if not runtime.barebones_config:
     kbtype_submenu.append(kbtype_windows_item)
 
     separator_below_kbtype_submenu_item = Gtk.SeparatorMenuItem()
-    menu.append(separator_below_kbtype_submenu_item)  #-------------------------------------#
+    main_menu.append(separator_below_kbtype_submenu_item)  #-------------------------------------#
+
+###############################################################
+# Tools submenu
+tools_submenu   = Gtk.Menu()
+tools_item      = Gtk.MenuItem(label='Tools')
+tools_item.set_submenu(tools_submenu)
+main_menu.append(tools_item)
+
+if not runtime.barebones_config:
 
     preferences_item = Gtk.MenuItem(label="Open Preferences App")
     preferences_item.connect("activate", fn_open_preferences)
-    menu.append(preferences_item)
+    tools_submenu.append(preferences_item)
 
 open_config_folder_item = Gtk.MenuItem(label="Open Config Folder")
 open_config_folder_item.connect("activate", fn_open_config_folder)
-menu.append(open_config_folder_item)
+tools_submenu.append(open_config_folder_item)
 
 if runtime.is_systemd:
     show_services_log_item = Gtk.MenuItem(label="Show Services Log")
     show_services_log_item.connect("activate", fn_show_services_log)
-    menu.append(show_services_log_item)
+    tools_submenu.append(show_services_log_item)
 
 separator_above_remove_icon_item = Gtk.SeparatorMenuItem()
-menu.append(separator_above_remove_icon_item)  #-------------------------------------#
+main_menu.append(separator_above_remove_icon_item)  #-------------------------------------#
 
 
 def load_autoload_tray_icon_setting():
@@ -726,13 +829,13 @@ autoload_tray_icon_item.connect("toggled", fn_save_autoload_tray_icon_setting)
 autostart_submenu.append(autoload_tray_icon_item)
 
 autostart_submenu_item.set_submenu(autostart_submenu)
-menu.append(autostart_submenu_item)
+main_menu.append(autostart_submenu_item)
 
 remove_tray_icon_item = Gtk.MenuItem(label="Remove Icon from Tray")
 remove_tray_icon_item.connect("activate", fn_remove_tray_icon)
-menu.append(remove_tray_icon_item)
+main_menu.append(remove_tray_icon_item)
 
-menu.show_all()
+main_menu.show_all()
 
 
 def main():
@@ -752,6 +855,7 @@ def main():
         """Callback for when settings change - update GTK UI."""
         if not runtime.barebones_config:
             GLib.idle_add(load_prefs_submenu_settings)
+            GLib.idle_add(load_capslock_mode_submenu_settings)
             GLib.idle_add(load_optspec_layout_submenu_settings)
             GLib.idle_add(load_kbtype_submenu_settings)
             GLib.idle_add(load_autoload_tray_icon_setting)
@@ -802,6 +906,8 @@ def main():
     if not runtime.barebones_config:
         # load the settings for the preferences submenu toggle items
         load_prefs_submenu_settings()
+        # load the setting for the CapsLock mode radio submenu
+        load_capslock_mode_submenu_settings()
         # load the settings for the optspec layout submenu
         load_optspec_layout_submenu_settings()
         # load the settings for the keyboard type submenu

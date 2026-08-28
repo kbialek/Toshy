@@ -23,6 +23,7 @@ echo -e "\nInstalling Toshy terminal commands..."
 
 mkdir -p "${LOCAL_BIN}"
 
+ln -sf "${TOSHY_BIN}/toshy-share.sh"                    "${LOCAL_BIN}/toshy-share"
 ln -sf "${TOSHY_BIN}/toshy-systemd-setup.sh"            "${LOCAL_BIN}/toshy-systemd-setup"
 ln -sf "${TOSHY_BIN}/toshy-systemd-remove.sh"           "${LOCAL_BIN}/toshy-systemd-remove"
 ln -sf "${TOSHY_BIN}/toshy-services-status.sh"          "${LOCAL_BIN}/toshy-services-status"
@@ -35,21 +36,22 @@ ln -sf "${TOSHY_BIN}/toshy-services-log.sh"             "${LOCAL_BIN}/toshy-serv
 ln -sf "${TOSHY_BIN}/toshy-config-start.sh"             "${LOCAL_BIN}/toshy-config-start"
 ln -sf "${TOSHY_BIN}/toshy-config-stop.sh"              "${LOCAL_BIN}/toshy-config-stop"
 ln -sf "${TOSHY_BIN}/toshy-config-restart.sh"           "${LOCAL_BIN}/toshy-config-restart"
-ln -sf "${TOSHY_BIN}/toshy-config-start-verbose.sh"     "${LOCAL_BIN}/toshy-config-start-verbose"
-ln -sf "${TOSHY_BIN}/toshy-config-start-verbose.sh"     "${LOCAL_BIN}/toshy-config-verbose-start"
 ln -sf "${TOSHY_BIN}/toshy-config-start-verbose.sh"     "${LOCAL_BIN}/toshy-debug"
 ln -sf "${TOSHY_BIN}/toshy-tray.sh"                     "${LOCAL_BIN}/toshy-tray"
 ln -sf "${TOSHY_BIN}/toshy-gui.sh"                      "${LOCAL_BIN}/toshy-gui"
+ln -sf "${TOSHY_BIN}/toshy-terminal-menu.sh"            "${LOCAL_BIN}/toshy-terminal-menu"
 ln -sf "${TOSHY_BIN}/toshy-env.sh"                      "${LOCAL_BIN}/toshy-env"
 ln -sf "${TOSHY_BIN}/toshy-venv.sh"                     "${LOCAL_BIN}/toshy-venv"
 ln -sf "${TOSHY_BIN}/toshy-fnmode.sh"                   "${LOCAL_BIN}/toshy-fnmode"
 ln -sf "${TOSHY_BIN}/toshy-devices.sh"                  "${LOCAL_BIN}/toshy-devices"
+ln -sf "${TOSHY_BIN}/toshy-keycheck.sh"                 "${LOCAL_BIN}/toshy-keycheck"
 ln -sf "${TOSHY_BIN}/toshy-libinput.sh"                 "${LOCAL_BIN}/toshy-libinput"
 ln -sf "${TOSHY_BIN}/toshy-versions.sh"                 "${LOCAL_BIN}/toshy-versions"
 ln -sf "${TOSHY_BIN}/toshy-reinstall.sh"                "${LOCAL_BIN}/toshy-reinstall"
 ln -sf "${TOSHY_BIN}/toshy-xkb-check.sh"                "${LOCAL_BIN}/toshy-xkb-check"
 ln -sf "${TOSHY_BIN}/toshy-machine-id.sh"               "${LOCAL_BIN}/toshy-machine-id"
 ln -sf "${TOSHY_BIN}/toshy-kblayout-check.sh"           "${LOCAL_BIN}/toshy-kblayout-check"
+ln -sf "${TOSHY_BIN}/toshy-detector-check.sh"           "${LOCAL_BIN}/toshy-detector-check"
 ln -sf "${TOSHY_BIN}/toshy-kwin-dbus-service.sh"        "${LOCAL_BIN}/toshy-kwin-dbus-service"
 ln -sf "${TOSHY_BIN}/toshy-cosmic-dbus-service.sh"      "${LOCAL_BIN}/toshy-cosmic-dbus-service"
 ln -sf "${TOSHY_BIN}/toshy-wlroots-dbus-service.sh"     "${LOCAL_BIN}/toshy-wlroots-dbus-service"
@@ -58,6 +60,7 @@ ln -sf "${TOSHY_BIN}/toshy-wlroots-dbus-service.sh"     "${LOCAL_BIN}/toshy-wlro
 echo ""
 echo "Finished installing Toshy terminal commands:"
 echo ""
+echo "- toshy-share"
 echo "- toshy-systemd-setup"
 echo "- toshy-systemd-remove"
 echo "- toshy-services-status"
@@ -70,21 +73,22 @@ echo "- toshy-services-log"
 echo "- toshy-config-start"
 echo "- toshy-config-stop"
 echo "- toshy-config-restart"
-echo "- toshy-config-start-verbose"
-echo "- toshy-config-verbose-start"
-echo "- toshy-config-debug"
+echo "- toshy-debug"
 echo "- toshy-tray"
 echo "- toshy-gui"
+echo "- toshy-terminal-menu"
 echo "- toshy-env"
 echo "- toshy-venv"
 echo "- toshy-fnmode"
 echo "- toshy-devices"
+echo "- toshy-keycheck"
 echo "- toshy-libinput"
 echo "- toshy-versions"
 echo "- toshy-reinstall"
 echo "- toshy-xkb-check"
 echo "- toshy-machine-id"
 echo "- toshy-kblayout-check"
+echo "- toshy-detector-check"
 echo "- toshy-kwin-dbus-service"
 echo "- toshy-cosmic-dbus-service"
 echo "- toshy-wlroots-dbus-service"
@@ -179,8 +183,10 @@ setup_path() {
     local files_needing_path=()
     
     for file in "${shell_files[@]}"; do
-        # Check all existing files, plus always include .profile for universal compatibility
-        if [ -f "${file}" ] || [[ "${file}" == *"profile"* ]]; then
+        # Check all existing files, plus always include the profile files and
+        # .bashrc (NixOS creates no user dotfiles, and interactive non-login
+        # bash reads only .bashrc, so it must be created if absent)
+        if [ -f "${file}" ] || [[ "${file}" == *"profile"* ]] || [[ "${file}" == *".bashrc" ]]; then
             if ! path_contains_local_bin "${file}"; then
                 files_needing_path+=("${file}")
             fi

@@ -3,11 +3,16 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 
 from toshy_common.logger import debug
+from toshy_common.modifier_modes import (
+    CAPSLOCK_MODES,
+    CAPSLOCK_MODE_HELP,
+    CAPSLOCK_MODE_LABELS,
+)
 
-# Configuration for help button appearance
-HELP_BUTTON_SIZE = 18   # Width and height in pixels - change here to resize all help buttons
+from toshy_gui.gui.app_css import SETTINGS_HELP_BTN_SIZE as HELP_BUTTON_SIZE
+
+# Configuration for panel layout
 COLUMN_SPACING   = 8    # Vertical gap (px) between rows within each column - lower = more compact
-PANEL_MARGIN     = 12   # Outer top/bottom margin (px) of the whole panel
 
 class SettingsPanel(Gtk.Box):
     """
@@ -31,49 +36,10 @@ class SettingsPanel(Gtk.Box):
         # Set up the panel layout
         self.setup_ui()
         
-        # Add margins
-        self.set_margin_top(PANEL_MARGIN)
-        self.set_margin_bottom(PANEL_MARGIN)
-        
-        # Connect to realize signal to set up CSS when widget is ready
-        self.connect('realize', self.on_realize)
+        # No panel-level top/bottom margins here: the main window's section
+        # spacing is the single source of truth for gaps between panels.
         
         debug("=== SettingsPanel.__init__ completed ===")
-        
-    def on_realize(self, widget):
-        """Set up CSS when widget is realized and has a display"""
-        css_provider = Gtk.CssProvider()
-        
-        css_data = f"""
-        .control-group-header {{
-            font-size: 14px;
-            font-weight: bold;
-            color: alpha(currentColor, 0.7);
-        }}
-        .settings-help-button {{
-            min-width: {HELP_BUTTON_SIZE}px;
-            min-height: {HELP_BUTTON_SIZE}px;
-            padding: 0px;
-            font-size: 14px;
-            font-weight: bold;
-        }}
-        .switch-control {{
-            margin-right: 8px;
-        }}
-        .radio-control {{
-            margin-right: 8px;
-        }}
-        """
-        css_provider.load_from_data(css_data, -1)
-        
-        # Apply CSS to the display
-        display = self.get_display()
-        if display:
-            Gtk.StyleContext.add_provider_for_display(
-                display,
-                css_provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
         
     def setup_ui(self):
         """Set up the settings panel user interface"""
@@ -94,7 +60,7 @@ class SettingsPanel(Gtk.Box):
         debug("=== SettingsPanel.setup_ui completed ===")
         
     def create_left_column(self):
-        """Create the left column with modifier key settings"""
+        """Create the left column with switches and the Option-key characters group"""
         debug("Creating left column...")
 
         column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=COLUMN_SPACING)
@@ -125,24 +91,6 @@ class SettingsPanel(Gtk.Box):
         )
         column.append(multi_lang_control)
 
-        # CapsLock as Cmd switch
-        caps_cmd_control = self.create_switch_with_help(
-            "CapsLock is Cmd key",
-            "Caps2Cmd",
-            "CapsLock is Cmd key",
-            "Modmap CapsLock to be Command key"
-        )
-        column.append(caps_cmd_control)
-
-        # Multipurpose CapsLock switch
-        caps_esc_control = self.create_switch_with_help(
-            "Multipurpose CapsLock: Esc, Cmd",
-            "Caps2Esc_Cmd",
-            "Multipurpose CapsLock: Esc, Cmd",
-            "Modmap CapsLock key to be:\n• Escape when tapped\n• Command key for hold/combo"
-        )
-        column.append(caps_esc_control)
-
         # Multipurpose Enter switch
         enter_cmd_control = self.create_switch_with_help(
             "Multipurpose Enter: Enter, Cmd",
@@ -151,15 +99,6 @@ class SettingsPanel(Gtk.Box):
             "Modmap Enter key to be:\n• Enter when tapped\n• Command key for hold/combo"
         )
         column.append(enter_cmd_control)
-
-        # Sublime Text 3 in VSCode switch
-        st3_control = self.create_switch_with_help(
-            "ST3 shortcuts in VSCode(s)",
-            "ST3_in_VSCode",
-            "ST3 shortcuts in VSCode(s)",
-            "Use shortcuts from Sublime Text 3 in Visual Studio Code (and variants)"
-        )
-        column.append(st3_control)
 
         # Forced Numpad switch
         numpad_control = self.create_switch_with_help(
@@ -183,11 +122,42 @@ class SettingsPanel(Gtk.Box):
         )
         column.append(media_control)
 
+        # Sublime Text 3 in VSCode switch
+        st3_control = self.create_switch_with_help(
+            "Sublime Text 3 shortcuts in VSCode(s)",
+            "ST3_in_VSCode",
+            "Sublime Text 3 shortcuts in VSCode(s)",
+            "Use shortcuts from Sublime Text 3 in Visual Studio Code (and variants)"
+        )
+        column.append(st3_control)
+
+        # Swap Spotlight & Input Switch toggle
+        swap_spotlight_control = self.create_switch_with_help(
+            "Swap Spotlight & Input Switch",
+            "swap_spotlight_and_input",
+            "Swap Spotlight & Input Switch",
+            "Swaps the launcher (\"Spotlight\") and input source switching shortcuts:\n"
+            "• Default: Cmd+Space opens the launcher, Ctrl+Space switches input source\n"
+            "• Swapped: Cmd+Space switches input source, Ctrl+Space opens the launcher\n\n"
+            "Before Mac OS X 10.4 \"Tiger\" introduced Spotlight in 2005, Cmd+Space was "
+            "the input source switch on the Mac, and Tiger upgraders using multiple input "
+            "sources kept that arrangement (with Spotlight on Ctrl+Space). This toggle "
+            "restores the classic arrangement for long-time multilingual Mac users.\n\n"
+            "Takes effect immediately when the config's Spotlight/input-switch keymaps "
+            "are active."
+        )
+        column.append(swap_spotlight_control)
+
+        # Option-key special characters radio group (swapped over from the
+        # right column to better balance the two column heights)
+        optspec_control = self.create_optspec_radio_group()
+        column.append(optspec_control)
+
         debug("Left column created")
         return column
 
     def create_right_column(self):
-        """Create the right column with numpad, media, and option keys"""
+        """Create the right column with Super Tap Passthru and CapsLock mode groups"""
         debug("Creating right column...")
 
         column = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=COLUMN_SPACING)
@@ -200,33 +170,15 @@ class SettingsPanel(Gtk.Box):
             column.append(placeholder)
             return column
 
-        # Option-key special characters radio group
-        optspec_control = self.create_optspec_radio_group()
-        column.append(optspec_control)
+        # CapsLock mode radio group (replaces legacy Caps2Cmd/Caps2Esc_Cmd
+        # switches); ordered above Super Tap to match the tray Preferences menu
+        capslock_mode_control = self.create_capslock_mode_radio_group()
+        column.append(capslock_mode_control)
 
-        # Super Tap Passthru section header
-        super_tap_header = Gtk.Label(label="Super Tap Passthru")
-        super_tap_header.add_css_class("control-group-header")
-        super_tap_header.set_halign(Gtk.Align.START)
-        column.append(super_tap_header)
-
-        # Multipurpose Left Opt switch
-        l_opt_control = self.create_switch_with_help(
-            "Multipurpose Left Opt: Super, Opt",
-            "l_opt_is_sup_and_opt",
-            "Multipurpose Left Opt: Super, Opt",
-            "Modmap Left Option position key to be:\n• Super/Meta when tapped\n• Option key for hold/combo"
-        )
-        column.append(l_opt_control)
-
-        # Multipurpose Left Cmd switch
-        l_cmd_control = self.create_switch_with_help(
-            "Multipurpose Left Cmd: Super, Cmd",
-            "l_cmd_is_sup_and_cmd",
-            "Multipurpose Left Cmd: Super, Cmd",
-            "Modmap Left Command positionkey to be:\n• Super/Meta when tapped\n• Command key for hold/combo"
-        )
-        column.append(l_cmd_control)
+        # Super Tap Passthru group (swapped over from the left column to
+        # better balance the two column heights)
+        super_tap_control = self.create_super_tap_group()
+        column.append(super_tap_control)
 
         debug("Right column created")
         return column
@@ -379,6 +331,66 @@ class SettingsPanel(Gtk.Box):
         
         return container
         
+    def create_super_tap_group(self):
+        """Create the Super Tap Passthru group (header plus two switches)"""
+        debug("Creating Super Tap Passthru group...")
+
+        # Container for the whole group
+        group_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        # Header with help button
+        header_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        header_container.add_css_class("control-group-header-bar")
+
+        header_label = Gtk.Label(label="Super Tap Passthru")
+        header_label.add_css_class("control-group-header")
+        header_container.append(header_label)
+
+        # Add expandable spacer to push help button to the right
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        header_container.append(spacer)
+
+        # Help button for the group
+        if self.parent_window:
+            help_title = "Super Tap Passthru"
+            help_text = (
+                "Makes a modifier key do double duty: a quick tap sends a Super "
+                "(Meta/Win) key tap, useful for opening app launchers or the "
+                "GNOME/KDE overview, while holding it keeps its normal Toshy "
+                "role for shortcut combos.\n\nEnable for the Left Option "
+                "position key, the Left Command position key, or both."
+            )
+            help_button = Gtk.Button(label="?")
+            help_button.set_size_request(HELP_BUTTON_SIZE, HELP_BUTTON_SIZE)
+            help_button.set_tooltip_text("Show help for Super Tap Passthru")
+            help_button.add_css_class("settings-help-button")
+            help_button.connect('clicked', lambda btn: self.show_help_dialog(help_title, help_text))
+            header_container.append(help_button)
+
+        group_container.append(header_container)
+
+        # Multipurpose Left Opt switch
+        l_opt_control = self.create_switch_with_help(
+            "Multipurpose Left Opt: Super, Opt",
+            "l_opt_is_sup_and_opt",
+            "Multipurpose Left Opt: Super, Opt",
+            "Modmap Left Option position key to be:\n• Super/Meta when tapped\n• Option key for hold/combo"
+        )
+        group_container.append(l_opt_control)
+
+        # Multipurpose Left Cmd switch
+        l_cmd_control = self.create_switch_with_help(
+            "Multipurpose Left Cmd: Super, Cmd",
+            "l_cmd_is_sup_and_cmd",
+            "Multipurpose Left Cmd: Super, Cmd",
+            "Modmap Left Command position key to be:\n• Super/Meta when tapped\n• Command key for hold/combo"
+        )
+        group_container.append(l_cmd_control)
+
+        debug("Super Tap Passthru group created")
+        return group_container
+
     def create_optspec_radio_group(self):
         """Create the Option-key special characters radio button group"""
         debug("Creating option-key radio group...")
@@ -389,6 +401,8 @@ class SettingsPanel(Gtk.Box):
         # Header with help button
         header_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         
+        header_container.add_css_class("control-group-header-bar")
+
         header_label = Gtk.Label(label="Option-key Special Characters")
         header_label.add_css_class("control-group-header")
         header_container.append(header_label)
@@ -457,11 +471,135 @@ class SettingsPanel(Gtk.Box):
         debug("Option-key radio group created")
         return group_container
         
+    def create_capslock_mode_radio_group(self):
+        """Create the CapsLock mode radio button group (canonical modes from
+        toshy_common.modifier_modes; radio group provides exclusivity)"""
+        debug("Creating CapsLock mode radio group...")
+
+        # Container for the whole group
+        group_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        # Header with help button
+        header_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+        header_container.add_css_class("control-group-header-bar")
+
+        header_label = Gtk.Label(label="CapsLock Mode")
+        header_label.add_css_class("control-group-header")
+        header_container.append(header_label)
+
+        # Add expandable spacer to push help button to the right
+        spacer = Gtk.Box()
+        spacer.set_hexpand(True)
+        header_container.append(spacer)
+
+        # Help button for the group
+        if self.parent_window:
+            help_title = "CapsLock Mode"
+            help_text = (
+                "What the Caps (CapsLock) key does. Each mode has its own help "
+                "button with details."
+                "\n\nIn this config, the physical Left Ctrl key's \"role\" is "
+                "context-dependent: it acts as a real Ctrl key (LEFT_CTRL) in "
+                "terminals, but as Super/Meta (LEFT_META) in GUI apps, where "
+                "the Cmd key equivalent handles most shortcuts. \"Role swap\" "
+                "modes give Caps that same split identity, and turn the "
+                "physical Left Ctrl key into a literal CapsLock toggle."
+                "\n\nDefault (*) is for Caps to just act like CapsLock."
+            )
+
+            help_button = Gtk.Button(label="?")
+            help_button.set_size_request(HELP_BUTTON_SIZE, HELP_BUTTON_SIZE)
+            help_button.set_tooltip_text("Show help for CapsLock modes")
+            help_button.add_css_class("settings-help-button")
+            help_button.connect('clicked', lambda btn: self.show_help_dialog(help_title, help_text))
+            header_container.append(help_button)
+
+        group_container.append(header_container)
+
+        # Radio buttons
+        radio_container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        radio_container.set_margin_start(20)  # Indent radio buttons
+
+        # Build data-driven from the canonical mode tuple; first button anchors the group.
+        # Each row gets its own help button with the mode's help text, matching the
+        # per-item help pattern of create_switch_with_help.
+        self.capslock_mode_radios_dct = {}
+        group_anchor_radio = None
+        for caps_mode in CAPSLOCK_MODES:
+            mode_label = CAPSLOCK_MODE_LABELS.get(caps_mode, caps_mode)
+            row_container = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+            mode_radio = Gtk.CheckButton(label=mode_label)
+            mode_radio.add_css_class("radio-control")
+            if group_anchor_radio is None:
+                group_anchor_radio = mode_radio
+            else:
+                mode_radio.set_group(group_anchor_radio)  # Join the group
+            mode_radio.setting_value = caps_mode
+            mode_radio.connect('toggled', self.on_capslock_mode_toggled)
+            row_container.append(mode_radio)
+
+            # Expandable spacer pushes the help button to the right
+            row_spacer = Gtk.Box()
+            row_spacer.set_hexpand(True)
+            row_container.append(row_spacer)
+
+            if self.parent_window:
+                mode_help_text = CAPSLOCK_MODE_HELP.get(caps_mode, mode_label)
+                mode_help_button = Gtk.Button(label="?")
+                mode_help_button.set_size_request(HELP_BUTTON_SIZE, HELP_BUTTON_SIZE)
+                mode_help_button.set_tooltip_text(f"Show help for: {mode_label}")
+                mode_help_button.add_css_class("settings-help-button")
+                mode_help_button.connect(
+                    'clicked',
+                    lambda btn, t=mode_label, h=mode_help_text:
+                        self.show_help_dialog(t, h))
+                row_container.append(mode_help_button)
+
+            radio_container.append(row_container)
+            self.capslock_mode_radios_dct[caps_mode] = mode_radio
+
+        # Load initial value
+        current_mode_radio = self.capslock_mode_radios_dct.get(self.cnfg.capslock_mode)
+        if current_mode_radio:
+            current_mode_radio.set_active(True)
+
+        group_container.append(radio_container)
+
+        debug("CapsLock mode radio group created")
+        return group_container
+
+    def on_capslock_mode_toggled(self, radio):
+        """Handle CapsLock mode radio button toggle events"""
+        if radio.get_active():  # Only respond to the button being activated
+            new_value = radio.setting_value
+
+            # Programmatic updates (settings monitor echoes via load_settings)
+            # re-fire 'toggled'; cnfg has already auto-reloaded by then, so a
+            # no-change save would just write the DB again and double the
+            # settings emission in the config's verbose log.
+            if getattr(self.cnfg, 'capslock_mode', None) == new_value:
+                return
+
+            debug(f"CapsLock mode changed to: {new_value}")
+
+            # Save to settings
+            setattr(self.cnfg, 'capslock_mode', new_value)
+            self.cnfg.save_settings()
+
     def on_switch_toggled(self, switch):
         """Handle switch toggle events"""
         setting_key = switch.setting_key
         new_value = switch.get_active()
-        
+
+        # Programmatic updates (initial load at construction, settings monitor
+        # echoes) re-fire 'toggled' after cnfg already holds the value; saving
+        # again would just rewrite the DB and re-emit settings in the config's
+        # verbose log.
+        if getattr(self.cnfg, setting_key, None) == new_value:
+            return
+
         debug(f"Switch toggled: {setting_key} = {new_value}")
         
         # Save to settings
@@ -472,6 +610,11 @@ class SettingsPanel(Gtk.Box):
         """Handle option-key radio button toggle events"""
         if radio.get_active():  # Only respond to the button being activated
             new_value = radio.setting_value
+
+            # No-change guard: see on_switch_toggled.
+            if getattr(self.cnfg, 'optspec_layout', None) == new_value:
+                return
+
             debug(f"Option-key layout changed to: {new_value}")
             
             # Save to settings
@@ -491,6 +634,11 @@ class SettingsPanel(Gtk.Box):
         else:
             new_theme = 'auto'
             
+        # No-change guard (initial set_selected at construction fires this):
+        # see on_switch_toggled.
+        if getattr(self.cnfg, 'gui_theme_mode', None) == new_theme:
+            return
+
         debug(f"Theme changed to: {new_theme}")
         
         # Save to settings
@@ -556,9 +704,10 @@ class SettingsPanel(Gtk.Box):
             
         # Update all switches using stored references
         switch_settings = [
-            'altgr_on_menu_key', 'multi_lang', 'ST3_in_VSCode', 'Caps2Cmd', 'Caps2Esc_Cmd',
+            'altgr_on_menu_key', 'multi_lang', 'ST3_in_VSCode',
             'Enter2Ent_Cmd', 'forced_numpad', 'media_arrows_fix',
-            'l_opt_is_sup_and_opt', 'l_cmd_is_sup_and_cmd'
+            'l_opt_is_sup_and_opt', 'l_cmd_is_sup_and_cmd',
+            'swap_spotlight_and_input'
         ]
         
         for setting_key in switch_settings:
@@ -571,6 +720,12 @@ class SettingsPanel(Gtk.Box):
                     debug(f"Updating {setting_key} switch to {current_value}")
                     switch.set_active(current_value)
         
+        # Update CapsLock mode radio buttons
+        target_caps_radio = self.capslock_mode_radios_dct.get(self.cnfg.capslock_mode)
+        if target_caps_radio and not target_caps_radio.get_active():
+            debug(f"Updating capslock_mode radio to {self.cnfg.capslock_mode}")
+            target_caps_radio.set_active(True)
+
         # Update option-key radio buttons
         current_optspec = getattr(self.cnfg, 'optspec_layout', 'US')
         

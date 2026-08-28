@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-__version__ = '20260620'                        # CLI option "--version" will print this out.
+__version__ = '20260820'                        # CLI option "--version" will print this out.
 
 import os
 os.environ['PYTHONDONTWRITEBYTECODE'] = '1'     # prevent this script from creating cache files
@@ -9,6 +9,7 @@ import pwd
 import sys
 import copy
 import glob
+import json
 import random
 import shutil
 import signal
@@ -19,6 +20,7 @@ import argparse
 import builtins
 import datetime
 import platform
+import tempfile
 import textwrap
 import subprocess
 
@@ -83,16 +85,15 @@ def signal_handler(sig, frame):
         sys.exit(1)
 
 
-if platform.system() != 'Windows':
-    signal.signal(signal.SIGINT,    signal_handler)
-    signal.signal(signal.SIGQUIT,   signal_handler)
-    signal.signal(signal.SIGHUP,    signal_handler)
-    signal.signal(signal.SIGUSR1,   signal_handler)
-    signal.signal(signal.SIGUSR2,   signal_handler)
-else:
-    signal.signal(signal.SIGINT,    signal_handler)
-    error(f'This is only meant to run on Linux. Exiting.')
+if platform.system() != 'Linux':
+    error(f'Toshy is only meant to run on Linux. Detected: {platform.system()}. Exiting.')
     sys.exit(1)
+
+signal.signal(signal.SIGINT,    signal_handler)
+signal.signal(signal.SIGQUIT,   signal_handler)
+signal.signal(signal.SIGHUP,    signal_handler)
+signal.signal(signal.SIGUSR1,   signal_handler)
+signal.signal(signal.SIGUSR2,   signal_handler)
 
 original_PATH_str       = os.getenv('PATH')
 if original_PATH_str is None:
@@ -159,18 +160,39 @@ fix_path_tmp_path       = os.path.join(run_tmp_dir, fix_path_tmp_file)
 # set a standard path for duration of script run, to avoid issues with user customized paths
 os.environ['PATH']      = '/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin'
 
+# NixOS keeps essentially nothing in the FHS locations above ('/usr/bin' has
+# only 'env'); the real system binaries (bash, pgrep, etc.) live in the
+# system profile. Append the Nix-style locations when they exist, so child
+# processes and 'env'-based shebang lookups keep working under the
+# sanitized PATH. Appending (not prepending) preserves the existing
+# resolution order everywhere else.
+for _nix_style_bin_dir in ['/run/wrappers/bin', '/run/current-system/sw/bin']:
+    if os.path.isdir(_nix_style_bin_dir):
+        os.environ['PATH'] += f':{_nix_style_bin_dir}'
+
+# Also retain any Nix store entries from the original PATH: the Toshy Nix
+# runtime wrapper prefixes tool locations there (procps, glib, zenity,
+# etc.), which the sanitized PATH would otherwise discard. Store paths are
+# root-owned and immutable, and these are appended, so retaining them
+# cannot reintroduce the user-writable shadowing this sanitization
+# prevents.
+if original_PATH_str:
+    for _orig_path_entry in original_PATH_str.split(':'):
+        if _orig_path_entry.startswith('/nix/store/'):
+            os.environ['PATH'] += f':{_orig_path_entry}'
+
 # deactivate Python virtual environment, if one is active, to avoid issues with sys.executable
 if sys.prefix != sys.base_prefix:
     os.environ["VIRTUAL_ENV"] = ""
     sys.path = [p for p in sys.path if not p.startswith(sys.prefix)]
     sys.prefix = sys.base_prefix
 
-do_not_ask_about_path = None
+home_local_bin_in_path = None
 if home_local_bin in original_PATH_str:
     with open(good_path_tmp_path, 'a') as file:
         file.write('Nothing to see here.')
     # subprocess.run(['touch', path_good_tmp_path])
-    do_not_ask_about_path = True
+    home_local_bin_in_path = True
 else:
     debug("Home user local bin not part of PATH string.")
 # do the 'else' of creating 'path_fix_tmp_path' later in function that prompts user
@@ -244,13 +266,17 @@ class InstallerSettings:
 
         self.autostart_tray_icon    = True
         self.unprivileged_user      = False
+        self.admin_capable_answer   = None      # 'y'/'n' from CLI latch or early question
 
         self.prep_only              = None
 
         # option flags for the "install" command:
         self.override_distro        = None      # will be a string if not None
         self.barebones_config       = None
+
         self.skip_native            = None
+        self.skip_update_check      = None
+
         self.fancy_pants            = None
         self.no_dbus_python         = None
         self.use_dev_keymapper      = None
@@ -556,6 +582,20 @@ def call_attn_to_pwd_prompt_if_needed():
                 "      attention function. Please notify the dev to fix this error.\n")
         return
 
+    # For 'doas' AFTER the first elevation, whether a prompt will appear is
+    # unknowable: opendoas '-n' fails whenever the rule lacks 'nopass',
+    # without consulting the 'persist' timestamp, and the timestamp files in
+    # /run/doas are internal implementation detail not worth depending on.
+    # The big banner would cry wolf on every elevated command while 'persist'
+    # is quietly satisfying them (Alpine, Chimera). Print an honest one-line
+    # note instead: emphasis enough for the case where the persist window
+    # really has lapsed and a prompt follows.
+    if cnfg.priv_elev_cmd == 'doas' and cnfg.first_priv_elev_done:
+        print()
+        print(fancy_str('  (A "doas" password prompt may appear...)  ', 'blue', bold=True))
+        print()
+        return
+
     # Get user attention if there is a password needed (prompt will appear after this)
     main_clr = 'blue'
     alt_clr = 'magenta'
@@ -572,6 +612,10 @@ def call_attn_to_pwd_prompt_if_needed():
     # After native package install, the sudo timestamp may have expired.
     # Block with input() so the user can return at their leisure before
     # the actual sudo prompt appears (which has its own timeout).
+    #
+    # NOTE: 'doas' never reaches this point (early return above). Its prompt
+    # has no timeout anyway (waits indefinitely on readpassphrase), so this
+    # Enter-gate would protect nothing there.
     if cnfg.first_priv_elev_done:
         input(fancy_str('  Press Enter to continue (elevated privileges expired)... ',
                             alt_clr, bold=True))
@@ -701,25 +745,6 @@ def ask_is_distro_updated():
         print()
         error("Try the installer again after you've done a full system update. Exiting.")
         safe_shutdown(1)
-
-
-def ask_add_home_local_bin():
-    """
-    Check if `~/.local/bin` is in original PATH. Done earlier in script.
-    Ask user if it is OK to add the `~/.local/bin` folder to the PATH permanently.
-    Create temp file to allow bincommands script to bypass question.
-    """
-    if do_not_ask_about_path:
-        pass
-    else:
-        print()
-        response = input('The "~/.local/bin" folder is not in PATH. OK to add it? [Y/n]: ') or 'y'
-        if response in ['y', 'Y']:
-            # Let's prompt a reboot when we need to add local-bin to the PATH
-            cnfg.should_reboot = True
-            # create temp file that will get script to add local bin to path without asking
-            with open(fix_path_tmp_path, 'a') as file:
-                file.write('Nothing to see here.')
 
 
 def ask_for_attn_on_info():
@@ -928,103 +953,127 @@ def check_kde_app_switcher():
             safe_shutdown(1)
 
 
-def elevate_privileges():
-    """Elevate privileges early in the installer process, or invoke unprivileged install"""
+def ask_admin_capability():
+    """Ask the admin-capability question as the first interaction of the install
+    or prep-only sequence (hoisted out of elevate_privileges), unless the answer
+    was latched by bootstrap via the hidden '--admin-capable' argument. Handles
+    the unprivileged-install acknowledgment gate on a "no" answer."""
 
-    print()     # blank line to separate
-    max_attempts = 3
+    if cnfg.admin_capable_answer is None:
+        print()     # blank line to separate
+        max_attempts = 3
 
-    # Ask politely if user is admin to avoid causing an "incident" report unnecessarily
-    for _ in range(max_attempts):
-        response = input(
-            f'Can user "{cnfg.user_name}" run admin commands (via sudo/doas/run0)? [y/n]: ')
-        if response.casefold() in ['y', 'n']:
-            # response is valid, so break loop and proceed with appropriate actions below
-            break
-        else:
+        # Ask politely if user is admin to avoid causing an "incident" report unnecessarily
+        # Keep this prompt's wording in sync with the same question in bootstrap.sh.
+        for _ in range(max_attempts):
+            response = input(
+                f'Can user "{cnfg.user_name}" run admin commands (via sudo/doas/run0)? [y/n]: ')
+            if response.casefold() in ['y', 'n']:
+                cnfg.admin_capable_answer = response.casefold()
+                break
+            else:
+                print()
+                error("Response invalid. Valid responses are 'y' or 'n'.")
+                print()     # blank line for separation, then continue loop
+        else:   # this "else" belongs to the "for" loop
             print()
-            error("Response invalid. Valid responses are 'y' or 'n'.")
-            print()     # blank line for separation, then continue loop
-    else:   # this "else" belongs to the "for" loop
+            error('Response invalid. Max attempts reached.')
+            safe_shutdown(1)
+
+    if cnfg.admin_capable_answer == 'y':
+        return
+
+    # The answer was "no" from here on down.
+    if cnfg.prep_only:
         print()
-        error('Response invalid. Max attempts reached.')
+        error('The "prep-only" command performs privileged system setup, so it')
+        error('can only be used by a user with "sudo/doas/run0" access.')
         safe_shutdown(1)
 
-    if response.casefold() == 'y':
-        cnfg.detect_elevation_command()     # Get the actual command for elevated privileges
+    secret_code = generate_secret_code()
+    print('\n\n')
+    print(fancy_str(
+        'ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!\n',
+        color_name='red', bold=True))
+    md_wrapped_str = md_wrap(f"""
+    The secret code for this run is "{secret_code}". You will need this.
 
-        # Do this here, only if the privilege elevation command is 'sudo':
-        # Invalidate any `sudo` ticket that might be hanging around, to maximize
-        # the length of time before `sudo` might demand the password again
-        if cnfg.priv_elev_cmd == 'sudo':
-            try:
-                subprocess.run(['sudo', '-k'], check=True)
-            except subprocess.CalledProcessError as proc_err:
-                error(f"ERROR: 'sudo' found, but 'sudo -k' did not work. Very strange.\n{proc_err}")
+    It is possible to install as an unprivileged user, but only after an
+    admin user first runs the full install or a "prep-only" sequence.
+    The admin user must install from a full desktop session, or from
+    a "su --login adminuser" shell instance. The admin user can do
+    just the "prep" steps with:
 
-        call_attn_to_pwd_prompt_if_needed()
-        try:
-            cmd_lst = [cnfg.priv_elev_cmd, 'bash', '-c', 'echo -e "\nUsing elevated privileges..."']
-            subprocess.run(cmd_lst, check=True)
-            cnfg.first_priv_elev_done = True
-        except subprocess.CalledProcessError as proc_err:
-            print()
-            if cnfg.prep_only:
-                print()
-                error(f'ERROR: Problem invoking "{cnfg.priv_elev_cmd}" command. Not an admin user?')
-                error(f'Only a user with "{cnfg.priv_elev_cmd}" access can use "prep-only" command.')
-            error(f'Problem invoking the "{cnfg.priv_elev_cmd}" command.')
-            print('Try answering "n" to admin question next time.')
-            safe_shutdown(1)
-    elif response.casefold() == 'n':
-        secret_code = generate_secret_code()
-        print('\n\n')
-        print(fancy_str(
-            'ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!  ALERT!\n',
-            color_name='red', bold=True))
-        md_wrapped_str = md_wrap(f"""
-        The secret code for this run is "{secret_code}". You will need this.
+    ./{this_file_name} prep-only
 
-        It is possible to install as an unprivileged user, but only after an
-        admin user first runs the full install or a "prep-only" sequence.
-        The admin user must install from a full desktop session, or from
-        a "su --login adminuser" shell instance. The admin user can do
-        just the "prep" steps with:
+    ... instead of using:
 
-        ./{this_file_name} prep-only
+    ./{this_file_name} install
 
-        ... instead of using:
-
-        ./{this_file_name} install
-
-        Use the "prep-only" command if it is not desired that Toshy
-        should also run when the admin user logs into a desktop session.
-        When using "su --login adminuser", that user will also need to
-        download an independent copy of the Toshy zip file to install from,
-        using a "wget" or "curl" command. Or use "sudo/doas/run0" to copy
-        the zip file from the unprivileged user's Downloads folder.
-        See the Wiki for a better example of the full "prep-only" sequence
-        with a separate admin user.
-        """)
-        print(md_wrapped_str)
+    Use the "prep-only" command if it is not desired that Toshy
+    should also run when the admin user logs into a desktop session.
+    When using "su --login adminuser", that user will also need to
+    download an independent copy of the Toshy zip file to install from,
+    using a "wget" or "curl" command. Or use "sudo/doas/run0" to copy
+    the zip file from the unprivileged user's Downloads folder.
+    See the Wiki for a better example of the full "prep-only" sequence
+    with a separate admin user.
+    """)
+    print(md_wrapped_str)
+    print()
+    md_wrapped_str = md_wrap(width=55, text="""
+    If you understand everything written above or already took care
+    of prepping the system and want to proceed with an unprivileged
+    install, enter the secret code:
+    """)
+    response = input(md_wrapped_str)
+    if response == secret_code:
+        # set a flag to bypass functions that do system "prep" work with elevated privileges
+        cnfg.unprivileged_user = True
         print()
-        md_wrapped_str = md_wrap(width=55, text="""
-        If you understand everything written above or already took care
-        of prepping the system and want to proceed with an unprivileged
-        install, enter the secret code:
-        """)
-        response = input(md_wrapped_str)
-        if response == secret_code:
-            # set a flag to bypass functions that do system "prep" work with elevated privileges
-            cnfg.unprivileged_user = True
+        print("Good code. Continuing with an unprivileged install of Toshy user components...")
+    else:
+        print()
+        error('Code does not match! Try the installer again after installing Toshy \n'
+                '     first using an admin user that has access to "sudo/doas/run0".')
+        safe_shutdown(1)
+
+
+def elevate_privileges():
+    """Establish the privilege elevation ticket. The capability question itself
+    is asked earlier by ask_admin_capability() (or latched from bootstrap), so
+    reaching this function means the user claimed admin capability."""
+
+    cnfg.detect_elevation_command()     # Get the actual command for elevated privileges
+
+    # Do this here, only if the privilege elevation command is 'sudo':
+    # Invalidate any `sudo` ticket that might be hanging around, to maximize
+    # the length of time before `sudo` might demand the password again
+    if cnfg.priv_elev_cmd == 'sudo':
+        try:
+            subprocess.run(['sudo', '-k'], check=True)
+        except subprocess.CalledProcessError as proc_err:
+            error(f"ERROR: 'sudo' found, but 'sudo -k' did not work. Very strange.\n{proc_err}")
+
+    call_attn_to_pwd_prompt_if_needed()
+    try:
+        # Establish the elevation ticket with a no-op command. Must not invoke
+        # 'bash' here: this runs BEFORE native package install, and busybox
+        # distros like Alpine have no bash until Toshy's package list installs
+        # it. The message itself needs no elevation, so print it from Python.
+        cmd_lst = [cnfg.priv_elev_cmd, 'true']
+        subprocess.run(cmd_lst, check=True)
+        print('\nUsing elevated privileges...')
+        cnfg.first_priv_elev_done = True
+    except subprocess.CalledProcessError as proc_err:
+        print()
+        if cnfg.prep_only:
             print()
-            print("Good code. Continuing with an unprivileged install of Toshy user components...")
-            return
-        else:
-            print()
-            error('Code does not match! Try the installer again after installing Toshy \n'
-                    '     first using an admin user that has access to "sudo/doas/run0".')
-            safe_shutdown(1)
+            error(f'ERROR: Problem invoking "{cnfg.priv_elev_cmd}" command. Not an admin user?')
+            error(f'Only a user with "{cnfg.priv_elev_cmd}" access can use "prep-only" command.')
+        error(f'Problem invoking the "{cnfg.priv_elev_cmd}" command.')
+        print('Try answering "n" to admin question next time.')
+        safe_shutdown(1)
 
 
 #####################################################################################################
@@ -1044,6 +1093,10 @@ distro_groups_map = {
         'aerynos',
     ],
 
+    'alpine-based': [
+        'alpine',
+    ],
+
     'alt-based': [
         'altlinux',
     ],
@@ -1052,6 +1105,7 @@ distro_groups_map = {
         'arch',
         'archarm',
         'arcolinux',
+        'artix',                # Arch, but no systemd
         'cachyos',
         'endeavouros',
         'garuda',
@@ -1067,6 +1121,7 @@ distro_groups_map = {
     'debian-based': [
         'debian',
         'deepin',
+        'devuan',               # Debian, but no systemd
         'kali',
         'linuxmint',
         'lmde',
@@ -1074,7 +1129,7 @@ distro_groups_map = {
         'q4os',
     ],
 
-    # NOTE: RHEL and Fedora immutables have separate distro ID lists
+    # NOTE: RHEL, Fedora standard and Fedora immutables all have separate distro ID lists
     'fedora-based': [
         'fedora',
         'fedoralinux',
@@ -1082,6 +1137,7 @@ distro_groups_map = {
         'ultramarine',
     ],
 
+    # NOTE: RHEL, Fedora standard and Fedora immutables all have separate distro ID lists
     # Fedora immutables using rpm-ostree, not standard Fedora
     'fedora-immutables': [
         'bazzite',
@@ -1095,9 +1151,9 @@ distro_groups_map = {
         'redcore',
     ],
 
-    # Use "tumbleweed-based" entry for Tumbleweed, "microos-based" for Aeon/Kalpa distro types
+    # NOTE: Use "tumbleweed-based" entry for Tumbleweed, "microos-based" for Aeon/Kalpa distro types
     'leap-based': [
-        'leap',
+        'leap',                     # in case OpenSUSE distros drop the "opensuse-"
         'opensuse-leap',
     ],
 
@@ -1109,14 +1165,20 @@ distro_groups_map = {
         'openmandriva',
     ],
 
-    # Use "leap-based" entry for Leap, "tumbleweed-based" for Tumbleweed
+    # NOTE: Use "leap-based" entry for Leap, "tumbleweed-based" for Tumbleweed
     'microos-based': [
         'opensuse-aeon',
         'opensuse-kalpa',
         'opensuse-microos',
     ],
 
-    # RHELs-only: Fedora standard and Fedora immutables have their own distro ID lists
+    # Counted as supported, but installed via its own dedicated path
+    # (Nix flake; see nix/README.md). Native packages come from the flake.
+    'nixos-based': [
+        'nixos',
+    ],
+
+    # NOTE: RHEL, Fedora standard and Fedora immutables all have separate distro ID lists
     'rhel-based': [
         'almalinux',
         'centos',
@@ -1130,10 +1192,12 @@ distro_groups_map = {
         'solus',
     ],
 
-    # Use "leap-based" entry for Leap, "microos-based" for Aeon/Kalpa distro types
+    # NOTE: Use "leap-based" entry for Leap, "microos-based" for Aeon/Kalpa distro types
     'tumbleweed-based': [
+        'opensuse-slowroll',        # minor variation of Tumbleweed with "slow" package updates
         'opensuse-tumbleweed',
-        'tumbleweed',
+        'slowroll',                 # in case OpenSUSE distros drop the "opensuse-"
+        'tumbleweed',               # in case OpenSUSE distros drop the "opensuse-"
     ],
 
     'ubuntu-based': [
@@ -1154,8 +1218,20 @@ distro_groups_map = {
 }
 
 
+# Distros counted as supported but installed via their own dedicated path
+# rather than the normal native-package + venv sequence. Marked with a '^'
+# footnote in the 'list-distros' index output.
+distros_with_own_install_path_lst = [
+    'nixos',
+]
+
+
 # Checklist of distro type representatives with
-# '/usr/bin/gdbus' pre-installed in clean VM:
+# '/usr/bin/gdbus' pre-installed in clean VM.
+# Verification that 'gdbus' is the most reliable
+# alternative for D-Bus commands in terminals,
+# vs using 'qdbus' (name and availability varies),
+# or 'dbus-send' (less capable, difficult to use).
 #
 # - AlmaLinux 8.x                               [Provided by 'glib2']
 # - AlmaLinux 9.x                               [Provided by 'glib2']
@@ -1167,6 +1243,11 @@ distro_groups_map = {
 # - openSUSE Leap 15.6                          [Provided by 'glib2-tools']
 # - Ubuntu 20.04 LTS                            [Provided by 'libglib2.0-bin']
 # - Void Linux (rolling)                        [Provided by 'glib']
+#
+# - NixOS 25.11 (Plasma 6, clean VM)            [NOT present in base install]
+#   (No FHS paths at all, and the base system profile does not include the
+#   glib CLI tools. Toshy's Nix runtime wrapper bundles 'glib' on PATH, so
+#   'gdbus' is guaranteed for Toshy's own processes. See nix/README.md.)
 #
 
 
@@ -1192,6 +1273,39 @@ pkg_groups_map = {
         'python-setuptools',
         'python-virtualenv',
         'wayland-devel',
+        'zenity',
+    ],
+
+    # NOTE: The 'shadow' package provides 'groupadd'/'usermod', which are not
+    # in Alpine's busybox base install. Desktop setups often pull it in as a
+    # dependency, but headless/minimal installs will not have it, so it must
+    # be listed here for the group management logic to work everywhere.
+    # NOTE: 'bash' is also not in the busybox base install, and everything in
+    # 'scripts/bin/' legitimately assumes bash post-install. Nothing that runs
+    # BEFORE this package list installs may invoke bash (see the POSIX-sh
+    # 'scripts/bootstrap.sh' and the no-op ticket in elevate_privileges()).
+    'alpine-based': [
+        'bash',
+        'cairo-dev',
+        'dbus-dev',
+        'evtest',
+        'gcc',
+        'git',
+        'gobject-introspection-dev',
+        'libayatana-appindicator-dev',
+        'libinput',
+        'libnotify',
+        'libxkbcommon-dev',
+        'linux-headers',
+        'musl-dev',
+        'pkgconf',
+        'py3-dbus',
+        'py3-evdev',
+        'py3-pip',
+        'py3-setuptools',
+        'python3-dev',
+        'shadow',
+        'wayland-dev',
         'zenity',
     ],
 
@@ -1458,6 +1572,14 @@ pkg_groups_map = {
         'zenity',
     ],
 
+    # NixOS: no native package list; all runtime dependencies are provided
+    # by the Nix flake (nix/toshy-runtime.nix). See nix/README.md. The
+    # sentinel entry guarantees a loud failure if any future code path
+    # consumes this list directly.
+    'nixos-based': [
+        'NIXOS-PKGS-COME-FROM-NIX-FLAKE-SEE-nix-README',
+    ],
+
     # NOTE: Do not add 'gnome-shell-extension-appindicator' to Fedora/RHELs.
     #       This will install extension but requires logging out of GNOME to activate.
     #       Also, installing DE-specific packages is probably a bad idea.
@@ -1687,7 +1809,7 @@ pip_pkgs   = [
     "inotify-simple",           # Monitor filesystem events
     "ordered-set",              # Set implementation that preserves insertion order (for key combos)
 
-    # TODO: Check on 'python-xlib' project by mid-2025 to see if this bug is fixed:
+    # TODO: Check on 'python-xlib' project yearly to see if this bug is fixed:
     #   [AttributeError: 'BadRRModeError' object has no attribute 'sequence_number']
     # If the bug is fixed, remove pinning to v0.31 here.
     # But it does not appear that the bug is ever likely to be fixed.
@@ -1730,6 +1852,10 @@ def get_supported_distro_ids_idx() -> str:
             line_length = len(distro[0]) + 2    # reset line length
             prev_char = distro[0]
 
+        # Mark distros that use their own dedicated install path
+        if distro in distros_with_own_install_path_lst:
+            distro = distro + '^'
+
         next_distro_with_comma = distro + ", "
         if line_length + len(next_distro_with_comma) > 80:
             distro_index += "\n\t    "          # insert newline and tab/spaces for continuation
@@ -1771,6 +1897,23 @@ def exit_with_invalid_distro_error(pkg_mgr_err=None):
     print(
         f'Try one of these with "--override-distro" option:'
         f'\n\n{get_supported_distro_ids_idx()}'
+    )
+    safe_shutdown(1)
+
+
+def exit_with_nixos_guidance():
+    """Utility function to show guidance and exit when running on NixOS"""
+    print()
+    error('ERROR: The standard install sequence cannot work on NixOS.')
+    print()
+    print(
+        'NixOS has no supported package manager logic, and system-level setup\n'
+        '(udev rules, groups, uinput module) must be managed declaratively in\n'
+        'the NixOS system configuration, along with a Nix-provided Python\n'
+        'runtime linked at:  ${XDG_STATE_HOME:-~/.local/state}/toshy/runtime\n'
+        '\n'
+        'Once the runtime and system pieces are in place, set up all of the\n'
+        f'user-level files with:  ./{this_file_name} install-user-files\n'
     )
     safe_shutdown(1)
 
@@ -1921,6 +2064,69 @@ class DistroQuirksHandler:
             except subprocess.CalledProcessError as e:
                 error(f"Failed to refresh dnf cache: \n\t{e}")
                 safe_shutdown(1)
+
+    @staticmethod
+    def handle_quirks_Alpine():
+        """
+        Guard clause for Alpine Linux: verify that eudev (not busybox mdev)
+        is the active device manager before installing anything.
+
+        Stock Alpine uses busybox mdev, which silently ignores everything in
+        '/etc/udev/rules.d', so Toshy's udev rules (and therefore device
+        access) would appear to install fine but never take effect. Alpine's
+        'setup-desktop' script normally switches the system to eudev, so a
+        typical desktop install passes this check without ever noticing it.
+
+        Detect-only (not auto-fix): switching a system's device manager
+        touches the sysinit runlevel, which is a bigger intervention than the
+        installer should make on the user's behalf. When mdev is detected,
+        bail out loudly with the exact one-line fix.
+        """
+        print('Doing prep/checks for Alpine-based distros...')
+
+        # Make sure we only handle these quirks in the correct distros
+        if cnfg.DISTRO_ID not in distro_groups_map['alpine-based']:
+            error('Alpine quirks handler called, but this is not Alpine-based?')
+            safe_shutdown(1)
+
+        # Installer usually runs as a normal user, and sbin dirs are often
+        # not in a non-root user's PATH, so give which() an explicit path.
+        sbin_aware_path     = '/usr/sbin:/sbin:/usr/bin:/bin'
+        udevadm_cmd         = shutil.which('udevadm', path=sbin_aware_path)
+
+        # Check whether a 'udev' service is registered in any OpenRC runlevel
+        # ('setup-devd udev' adds udev/udev-trigger/udev-settle to sysinit).
+        udev_svc_registered = False
+        try:
+            result = subprocess.run(['rc-update', 'show', '-v'],
+                                    stdout=PIPE, stderr=PIPE, universal_newlines=True)
+            for line in result.stdout.splitlines():
+                # Line format: " udev | sysinit" (service name is first token)
+                fields = line.split('|')
+                if not fields or not fields[0].strip() == 'udev':
+                    continue
+                if len(fields) > 1 and fields[1].strip():
+                    udev_svc_registered = True
+                    break
+        except FileNotFoundError:
+            # No 'rc-update' means this is not an OpenRC system after all;
+            # leave the flag False and let the guard below explain.
+            pass
+
+        if udevadm_cmd and udev_svc_registered:
+            print('Device manager check passed: eudev appears to be active.')
+            return
+
+        print()
+        error('ERROR: Alpine appears to be using busybox mdev, not eudev.')
+        error('Toshy requires udev rules support, which mdev does not provide.')
+        error('The udev rules would install without error but never take effect.')
+        error('')
+        error('To switch this system to eudev, run this command and reboot:')
+        error(f'    {cnfg.priv_elev_cmd} setup-devd udev')
+        error('')
+        error('Then re-run the Toshy setup script.')
+        safe_shutdown(1)
 
     @staticmethod
     def handle_quirks_Arch():
@@ -2930,6 +3136,21 @@ class PackageInstallDispatcher:
         native_pkg_installer.install_pkg_list(cmd_lst, cnfg.pkgs_for_distro)
 
     ###########################################################################
+    ###  NIXOS (GUARD ONLY)  ##################################################
+    ###########################################################################
+    @staticmethod
+    def install_on_nix_distro():
+        """Guard method for NixOS: the normal native-package sequence never
+        applies (the installer exits with guidance long before dispatch), so
+        reaching this method means a sequencing bug. Fail loudly."""
+        print()
+        error('ERROR: The native package installer was dispatched for NixOS.')
+        error('NixOS uses its own dedicated install path and should never')
+        error('reach this point. See "nix/README.md" in the Toshy repo, and')
+        error('please report this as an installer sequencing bug.')
+        safe_shutdown(1)
+
+    ###########################################################################
     ###  APK DISTROS  #########################################################
     ###########################################################################
     @staticmethod
@@ -2937,6 +3158,11 @@ class PackageInstallDispatcher:
         """utility function that gets dispatched for distros that use APK package manager"""
         native_pkg_installer.check_for_pkg_mgr_cmd('apk')
         call_attn_to_pwd_prompt_if_needed()
+
+        # Quirks handler guards against busybox mdev being the active device
+        # manager (udev rules would be silently ignored), before anything installs.
+        if cnfg.DISTRO_ID in distro_groups_map['alpine-based']:
+            DistroQuirksHandler.handle_quirks_Alpine()
 
         # Quirks handler resolves AppIndicator package name and enables user
         # repo if needed, before main install logic runs.
@@ -2985,6 +3211,7 @@ class PackageManagerGroups:
         self.emerge_distros     = []    # 'emerge':                 Gentoo
         self.eopkg_distros      = []    # 'eopkg':                  Solus
         self.moss_distros       = []    # 'moss':                   AerynOS (was Serpent OS)
+        self.nix_distros        = []    # 'nix':                    NixOS (guard only)
         self.pacman_distros     = []    # 'pacman':                 Arch (BTW)
         self.rpmostree_distros  = []    # 'rpm-ostree':             Fedora atomic/immutables
         self.transupd_distros   = []    # 'transactional-update':   openSUSE Aeon/Kalpa/MicroOS
@@ -3001,6 +3228,7 @@ class PackageManagerGroups:
         try:
 
             # 'apk': Alpine/Chimera
+            self.apk_distros            += distro_groups_map['alpine-based']
             self.apk_distros            += distro_groups_map['chimera-based']
 
             # 'apt': Debian/Ubuntu, ALT Linux (uses APT-RPM)
@@ -3022,6 +3250,9 @@ class PackageManagerGroups:
 
             # 'moss': AerynOS (was Serpent OS)
             self.moss_distros           += distro_groups_map['aerynos-based']
+
+            # 'nix': NixOS (guard only; NixOS uses its own dedicated install path)
+            self.nix_distros            += distro_groups_map['nixos-based']
 
             # 'pacman': Arch, BTW
             self.pacman_distros         += distro_groups_map['arch-based']
@@ -3053,6 +3284,7 @@ class PackageManagerGroups:
             tuple(self.emerge_distros):     PackageInstallDispatcher.install_on_emerge_distro,
             tuple(self.eopkg_distros):      PackageInstallDispatcher.install_on_eopkg_distro,
             tuple(self.moss_distros):       PackageInstallDispatcher.install_on_moss_distro,
+            tuple(self.nix_distros):        PackageInstallDispatcher.install_on_nix_distro,
             tuple(self.pacman_distros):     PackageInstallDispatcher.install_on_pacman_distro,
             tuple(self.rpmostree_distros):  PackageInstallDispatcher.install_on_rpmostree_distro,
             tuple(self.transupd_distros):   PackageInstallDispatcher.install_on_transupd_distro,
@@ -3220,8 +3452,16 @@ def setup_uinput_module():
         if not os.path.isfile(filepath):
             return False
         try:
-            check_cmd = f"{cnfg.priv_elev_cmd} grep -q '{pattern}' {filepath}"
-            subprocess.run(check_cmd, shell=True, check=True)
+            # List-form on purpose, NOT 'shell=True': opendoas keys its
+            # 'persist' timestamp on the parent process's PID and start time
+            # (see timestamp_path() in opendoas timestamp.c). A shell layer
+            # gives doas a brand-new '/bin/sh' parent on every call, so the
+            # ticket never matches and doas re-prompts for the password each
+            # time (Alpine, Chimera). Direct exec keeps this Python process
+            # as the stable parent. Same reasoning for other elevated
+            # commands below and in install_udev_rules().
+            cmd_lst = [cnfg.priv_elev_cmd, 'grep', '-q', pattern, filepath]
+            subprocess.run(cmd_lst, check=True)
             return True
         except subprocess.CalledProcessError:
             return False
@@ -3229,9 +3469,14 @@ def setup_uinput_module():
     # Helper to write uinput to a config file
     def write_uinput_config(filepath, append=False):
         """Write uinput to config file, optionally appending"""
-        tee_flag = '-a' if append else ''
-        command = f"echo 'uinput' | {cnfg.priv_elev_cmd} tee {tee_flag} {filepath} >/dev/null"
-        subprocess.run(command, shell=True, check=True)
+        # List-form + 'input=' instead of a shell pipeline, to keep the doas
+        # 'persist' ticket valid (see comment in file_contains_uinput above).
+        cmd_lst = [cnfg.priv_elev_cmd, 'tee']
+        if append:
+            cmd_lst += ['-a']
+        cmd_lst += [filepath]
+        subprocess.run(cmd_lst, input='uinput\n', universal_newlines=True,
+                        stdout=DEVNULL, check=True)
 
     # Check and configure systemd-style persistence
     if systemd_available:
@@ -3263,8 +3508,12 @@ def setup_uinput_module():
         if is_dual_init and not os.path.isfile(etc_modules_path):
             print(f"Creating file for dual-init compatibility: '{etc_modules_path}'")
             try:
-                cmd = f"{cnfg.priv_elev_cmd} touch {etc_modules_path}"
-                subprocess.run(cmd, shell=True, check=True)
+                # List-form for doas 'persist' consistency (see comment in
+                # file_contains_uinput above). Currently only reachable on
+                # sudo-based dual-init distros, but this uses the generic
+                # elevation command, so it should not carry the shell layer.
+                cmd_lst = [cnfg.priv_elev_cmd, 'touch', etc_modules_path]
+                subprocess.run(cmd_lst, check=True)
             except subprocess.CalledProcessError as proc_err:
                 error(f"Problem creating {etc_modules_path}:\n\t{proc_err}")
 
@@ -3365,12 +3614,16 @@ def install_udev_rules():
 
     # Only write the file if it doesn't exist or its contents are different from current rule
     if rules_file_missing_or_content_differs():
-        command_str             = f'{cnfg.priv_elev_cmd} tee {rules_file_path}'
+        # List-form, NOT 'shell=True', to keep the doas 'persist' ticket
+        # valid (see comment in file_contains_uinput in setup_uinput_module).
+        # No stdout redirect: tee echoing the rules content is intentional,
+        # displaying it under the header printed just below.
+        cmd_lst                 = [cnfg.priv_elev_cmd, 'tee', rules_file_path]
         try:
             call_attn_to_pwd_prompt_if_needed()
             print(f'Using these "udev" rules for "uinput" device: ')
             print()
-            subprocess.run(command_str, input=new_rules_content.encode(), shell=True, check=True)
+            subprocess.run(cmd_lst, input=new_rules_content.encode(), check=True)
             if not rules_file_missing_or_content_differs():
                 print()
                 print(f'Toshy "udev" rules file successfully installed.')
@@ -3520,6 +3773,26 @@ def add_user_to_group(group_name: str, user_name: str) -> None:
     enable_prompt_for_reboot()
 
 
+def warn_if_missing_input_group():
+    """Passive check that warns (but does not fix) if the user does not appear
+    to be a member of the 'input' group. Used by the user-files-only sequence,
+    where system-level setup is the responsibility of external management.
+    Returns True if a warning was issued, False if membership looks OK."""
+    try:
+        input_grp = grp.getgrnam('input')
+    except KeyError:
+        error("Group 'input' does not exist on this system.")
+        error("System-level setup (udev rules, groups) must be handled externally.")
+        return True
+    if cnfg.user_name not in input_grp.gr_mem:
+        error(f"User '{cnfg.user_name}' does not appear to be in the 'input' group")
+        error("(or the membership is not active yet in this session).")
+        error("Toshy will not function until group membership and udev rules are")
+        error("in place, managed externally (e.g. in the NixOS system config).")
+        return True
+    return False
+
+
 def verify_user_groups():
     """
     Check if the 'input' group exists and user is in group.
@@ -3559,8 +3832,8 @@ def verify_user_groups():
 
 
 # def clone_keymapper_branch():
-#     """Clone the designated keymapper branch from GitHub"""
-#     print(f'\n\n§  Cloning keymapper branch...\n{cnfg.separator}')
+#     """Clone the keymapper repo and check out the designated ref (branch/tag/commit)"""
+#     print(f'\n\n§  Cloning keymapper repo...\n{cnfg.separator}')
 
 #     # Check if `git` command exists. If not, exit script with error.
 #     has_git = shutil.which('git')
@@ -3574,67 +3847,204 @@ def verify_user_groups():
 #             shutil.rmtree(cnfg.keymapper_tmp_path)
 #         except (OSError, PermissionError, FileNotFoundError) as file_err:
 #             error(f"Problem removing existing '{cnfg.keymapper_tmp_path}' folder:\n\t{file_err}")
+
+#     # Resolve which ref to check out. Default is the stable branch. The
+#     # '--dev-keymapper' flag selects the dev branch, or any ref (branch,
+#     # tag, or commit SHA) when given an explicit value.
+#     if cnfg.use_dev_keymapper:
+#         if cnfg.keymapper_cust_branch:
+#             _km_ref = cnfg.keymapper_cust_branch
+#         else:
+#             _km_ref = cnfg.keymapper_dev_branch
+#     else:
+#         _km_ref = cnfg.keymapper_branch
+
+#     # Full clone (no '-b'), so any commit in history is reachable for the
+#     # checkout. A SHA cannot be supplied to 'git clone -b', and bisect-style
+#     # installs need the full history present.
+#     _clone_cmd_lst = ['git', 'clone', cnfg.keymapper_url, cnfg.keymapper_tmp_path]
+#     print(f"Keymapper clone command:\n  {' '.join(_clone_cmd_lst)}")
 #     try:
-#         subprocess.run(cnfg.keymapper_clone_cmd.split() + [cnfg.keymapper_tmp_path], check=True)
+#         subprocess.run(_clone_cmd_lst, check=True)
 #     except subprocess.CalledProcessError as proc_err:
 #         print()
-#         error(f'Problem while cloning keymapper branch from GitHub:\n\t{proc_err}')
+#         error(f'Problem while cloning keymapper repo from GitHub:\n\t{proc_err}')
 #         safe_shutdown(1)
+
+#     # Check out the resolved ref. Passed as a list element (never split), so a
+#     # ref containing quotes/spaces survives intact.
+#     _checkout_cmd_lst = ['git', 'checkout', _km_ref]
+#     print(f"Keymapper checkout command:\n  git checkout {_km_ref}")
+#     try:
+#         subprocess.run(_checkout_cmd_lst, cwd=cnfg.keymapper_tmp_path, check=True)
+#     except subprocess.CalledProcessError as proc_err:
+#         print()
+#         error(f"Problem checking out keymapper ref '{_km_ref}':\n\t{proc_err}")
+#         safe_shutdown(1)
+
 #     show_task_completed_msg()
 
 
-def clone_keymapper_branch():
-    """Clone the keymapper repo and check out the designated ref (branch/tag/commit)"""
-    print(f'\n\n§  Cloning keymapper repo...\n{cnfg.separator}')
-
-    # Check if `git` command exists. If not, exit script with error.
-    has_git = shutil.which('git')
-    if not has_git:
-        print(f'ERROR: "git" is not installed, for some reason. Cannot continue.')
-        safe_shutdown(1)
-
-    if os.path.exists(cnfg.keymapper_tmp_path):
-        # force a fresh copy of keymapper every time script is run
-        try:
-            shutil.rmtree(cnfg.keymapper_tmp_path)
-        except (OSError, PermissionError, FileNotFoundError) as file_err:
-            error(f"Problem removing existing '{cnfg.keymapper_tmp_path}' folder:\n\t{file_err}")
-
-    # Resolve which ref to check out. Default is the stable branch. The
-    # '--dev-keymapper' flag selects the dev branch, or any ref (branch,
-    # tag, or commit SHA) when given an explicit value.
+def resolve_keymapper_ref():
+    """Resolve which keymapper ref to install. Default is the stable branch.
+    The '--dev-keymapper' flag selects the dev branch, or any ref (branch,
+    tag, or commit SHA) when given an explicit value."""
     if cnfg.use_dev_keymapper:
         if cnfg.keymapper_cust_branch:
-            _km_ref = cnfg.keymapper_cust_branch
+            return cnfg.keymapper_cust_branch
+        return cnfg.keymapper_dev_branch
+    return cnfg.keymapper_branch
+
+
+def preflight_keymapper_source():
+    """Verify that the keymapper source will be obtainable, BEFORE any
+    destructive steps run (config folder replacement). A failure after the
+    config tree is replaced would leave new config files coupled to the old
+    keymapper still in the venv until a rerun succeeds, so fail fast here.
+
+    Vendored refs: verify the vendored folder is present and populated.
+    Custom refs: verify 'git' exists and the remote is reachable; branch and
+    tag refs are verified to exist on the remote. Commit SHAs cannot be
+    listed by 'git ls-remote', so for SHA-like refs only remote reachability
+    is verified (the clone itself remains the real test)."""
+
+    keymapper_ref = resolve_keymapper_ref()
+
+    vendored_folder_for_ref = {
+        cnfg.keymapper_branch:      'xwaykeyz-main',
+        cnfg.keymapper_dev_branch:  'xwaykeyz-dev_beta',
+    }
+    vendored_folder_name = vendored_folder_for_ref.get(keymapper_ref)
+
+    if vendored_folder_name:
+        vendored_dir_path = os.path.join(this_file_dir, 'vendors', vendored_folder_name)
+        if os.path.isfile(os.path.join(vendored_dir_path, 'pyproject.toml')):
+            return      # vendored source present; nothing else to verify
+        warn(f"Vendored keymapper source not found: '{vendored_folder_name}'")
+        warn('Will need to clone the keymapper from the remote repo instead.')
+
+    # Custom ref, or vendored copy missing: the clone fallback will run later,
+    # so its prerequisites get verified now.
+    if not shutil.which('git'):
+        print()
+        error('ERROR: A keymapper clone will be needed, but "git" is not installed.')
+        error('Install "git" (or restore the vendored keymapper folder) and retry.')
+        safe_shutdown(1)
+
+    looks_like_sha = bool(re.fullmatch(r'[0-9a-fA-F]{7,40}', keymapper_ref))
+    probe_ref = 'HEAD' if looks_like_sha else keymapper_ref
+    cmd_lst = ['git', 'ls-remote', '--exit-code', cnfg.keymapper_url, probe_ref]
+    try:
+        subprocess.run(cmd_lst, check=True, stdout=DEVNULL, stderr=DEVNULL, timeout=30)
+    except subprocess.TimeoutExpired:
+        print()
+        error(f'ERROR: Timed out checking the keymapper remote repo:')
+        error(f'    {cnfg.keymapper_url}')
+        error('Check the network connection and retry.')
+        safe_shutdown(1)
+    except subprocess.CalledProcessError:
+        print()
+        if looks_like_sha:
+            error(f'ERROR: The keymapper remote repo is not reachable:')
+            error(f'    {cnfg.keymapper_url}')
         else:
-            _km_ref = cnfg.keymapper_dev_branch
-    else:
-        _km_ref = cnfg.keymapper_branch
+            error(f"ERROR: Keymapper ref '{keymapper_ref}' was not found on the remote")
+            error(f'repo (or the repo is unreachable):')
+            error(f'    {cnfg.keymapper_url}')
+        error('Nothing has been modified. Fix the ref or connection and retry.')
+        safe_shutdown(1)
+
+
+def prep_keymapper_files():
+    """Stage the keymapper source files that `pip` will install later.
+
+    Prefers the vendored copy of the keymapper that ships inside the Toshy repo,
+    so that installing from a release zip (or any checkout) works with no network
+    access. Falls back to cloning from GitHub only when a custom ref is requested,
+    or when the expected vendored copy is somehow missing.
+
+    Nothing is installed here. The files are staged into 'cnfg.keymapper_tmp_path'
+    for 'install_pip_packages()' to install into the venv.
+    """
+    print(f'\n\n§  Prepping keymapper files...\n{cnfg.separator}')
+
+    keymapper_ref = resolve_keymapper_ref()
+
+    # Map the branches that have vendored copies onto their folder names. Any ref
+    # that is not a key here (an arbitrary branch, tag, or commit SHA) must be
+    # fetched from the remote repo.
+    vendored_folder_for_ref = {
+        cnfg.keymapper_branch:      'xwaykeyz-main',
+        cnfg.keymapper_dev_branch:  'xwaykeyz-dev_beta',
+    }
+
+    vendored_folder_name = vendored_folder_for_ref.get(keymapper_ref)
+
+    # Always start from a clean temp folder, no matter which source is used.
+    remove_keymapper_tmp_folder()
+
+    if vendored_folder_name:
+        vendored_dir_path = os.path.join(this_file_dir, 'vendors', vendored_folder_name)
+
+        if os.path.isfile(os.path.join(vendored_dir_path, 'pyproject.toml')):
+            print(f"Using vendored keymapper source: '{vendored_folder_name}'")
+            try:
+                shutil.copytree(vendored_dir_path, cnfg.keymapper_tmp_path)
+                show_task_completed_msg()
+                return
+            except (OSError, PermissionError, shutil.Error) as file_err:
+                error(f'Problem copying vendored keymapper source:\n\t{file_err}')
+                safe_shutdown(1)
+
+        warn(f"Vendored keymapper source not found: '{vendored_folder_name}'")
+        warn('Falling back to cloning the keymapper repo from GitHub.')
+
+    clone_keymapper_ref(keymapper_ref)
+    show_task_completed_msg()
+
+
+def remove_keymapper_tmp_folder():
+    """Remove any existing temporary keymapper folder, to force a fresh copy."""
+    if not os.path.exists(cnfg.keymapper_tmp_path):
+        return
+    try:
+        shutil.rmtree(cnfg.keymapper_tmp_path)
+    except (OSError, PermissionError, FileNotFoundError) as file_err:
+        error(f"Problem removing existing '{cnfg.keymapper_tmp_path}' folder:\n\t{file_err}")
+
+
+def clone_keymapper_ref(keymapper_ref):
+    """Clone the keymapper repo and check out the given ref (branch/tag/commit)."""
+    print(f'Cloning keymapper repo to get ref: {keymapper_ref}')
+
+    # Check if `git` command exists. If not, exit script with error.
+    if not shutil.which('git'):
+        print(f'ERROR: "git" is not installed, for some reason. Cannot continue.')
+        safe_shutdown(1)
 
     # Full clone (no '-b'), so any commit in history is reachable for the
     # checkout. A SHA cannot be supplied to 'git clone -b', and bisect-style
     # installs need the full history present.
-    _clone_cmd_lst = ['git', 'clone', cnfg.keymapper_url, cnfg.keymapper_tmp_path]
-    print(f"Keymapper clone command:\n  {' '.join(_clone_cmd_lst)}")
+    clone_cmd_lst = ['git', 'clone', cnfg.keymapper_url, cnfg.keymapper_tmp_path]
+    print(f"Keymapper clone command:\n  {' '.join(clone_cmd_lst)}")
+
     try:
-        subprocess.run(_clone_cmd_lst, check=True)
+        subprocess.run(clone_cmd_lst, check=True)
     except subprocess.CalledProcessError as proc_err:
         print()
         error(f'Problem while cloning keymapper repo from GitHub:\n\t{proc_err}')
         safe_shutdown(1)
 
-    # Check out the resolved ref. Passed as a list element (never split), so a
-    # ref containing quotes/spaces survives intact.
-    _checkout_cmd_lst = ['git', 'checkout', _km_ref]
-    print(f"Keymapper checkout command:\n  git checkout {_km_ref}")
+    # Check out the resolved ref.
+    checkout_cmd_lst = ['git', '-C', cnfg.keymapper_tmp_path, 'checkout', keymapper_ref]
+    print(f"Keymapper checkout command:\n  {' '.join(checkout_cmd_lst)}")
+
     try:
-        subprocess.run(_checkout_cmd_lst, cwd=cnfg.keymapper_tmp_path, check=True)
+        subprocess.run(checkout_cmd_lst, check=True)
     except subprocess.CalledProcessError as proc_err:
         print()
-        error(f"Problem checking out keymapper ref '{_km_ref}':\n\t{proc_err}")
+        error(f"Problem checking out keymapper ref '{keymapper_ref}':\n\t{proc_err}")
         safe_shutdown(1)
-
-    show_task_completed_msg()
 
 
 def is_barebones_config_file() -> bool:
@@ -3849,23 +4259,31 @@ def install_toshy_files():
             except (OSError, PermissionError, FileNotFoundError) as file_err:
                 error(f'Problem removing existing Toshy config folder after backup:\n\t{file_err}')
         patterns_to_ignore = [
-                '.git_hooks',
-                '.git_hooks_install.sh',
-                '.github',
-                '.gitignore',
-                '__pycache__',
-                'CONTRIBUTING.md',
-                'DO_NOT_USE_requirements.txt',
-                keymapper_tmp_dir,
-                'kwin-application-switcher',
-                'LICENSE',
-                'packages.json',
-                'prep_centos_before_setup.sh',
-                'pyrightconfig.json',
-                'README.md',
-                'requirements.txt',
-                'ruff.toml',
-                this_file_name,
+            '.git',
+            '.git_hooks',
+            '.git_hooks_install.sh',
+            '.github',
+            '.gitignore',
+            '__pycache__',
+            'CONTRIBUTING.md',
+            'DO_NOT_USE_requirements.txt',
+            'flake.lock',
+            'flake.nix',
+            'nix',
+            keymapper_tmp_dir,
+            'kwin-application-switcher',
+            'LICENSE',
+            'packages.json',
+            'prep_centos_before_setup.sh',
+            'pyrightconfig.json',
+            'README.md',
+            'requirements.txt',
+            'reset_dev_beta.sh',
+            'ruff.toml',
+            'sync_vendors.sh',
+            this_file_name,
+            'tests',
+            'vendors',
         ]
         # must use list unpacking (*) ignore_patterns() requires individual pattern arguments
         ignore_fn = shutil.ignore_patterns(*patterns_to_ignore)
@@ -4317,6 +4735,17 @@ def install_pip_packages():
 def install_bin_commands():
     """Install the convenient terminal commands (symlinks to scripts) to manage Toshy"""
     print(f'\n\n§  Installing Toshy terminal commands...\n{cnfg.separator}')
+
+    if not home_local_bin_in_path:
+        # Without this the just-installed commands would not resolve, so it is
+        # done unconditionally (idempotent; performed by the bincommands script
+        # when it sees the temp file). Requires a re-login to take effect.
+        print('The "~/.local/bin" folder is not in PATH. It will be added.')
+        print('(Takes effect after logging out and back in, or rebooting.)')
+        cnfg.should_reboot = True
+        with open(fix_path_tmp_path, 'a') as file:
+            file.write('Nothing to see here.')
+
     script_path = os.path.join(cnfg.toshy_dir_path, 'scripts', 'toshy-bincommands-setup.sh')
     try:
         subprocess.run([script_path], check=True)
@@ -4728,7 +5157,7 @@ def autostart_tray_icon():
 def apply_tweaks_Cinnamon():
     """Utility function to add desktop tweaks to Cinnamon"""
 
-    cmd_lst         = ['./install.sh']
+    cmd_lst         = ['bash', './install.sh']
     dir_path        = os.path.join(this_file_dir, 'cinnamon-extension')
 
     try:
@@ -4737,8 +5166,223 @@ def apply_tweaks_Cinnamon():
     except subprocess.CalledProcessError as proc_err:
         error(f'Problem while installing Cinnamon extension:\n\t{proc_err}')
 
-    # Let user know how to get Cmd+Space to open the Cinnamon Menu applet
-    _show_cinnamon_menu_hotkey_reminder()
+    # Try to auto-configure the Cinnamon menu applet hotkey (Cmd+Space ->
+    # Ctrl+Escape) by rebinding the menu applet's 'overlay-key' primary.
+    # Only if that fails do we fall back to the manual reminder dialog.
+    overlay_ok, reloaded = _set_cinnamon_menu_overlay_key()
+    if overlay_ok:
+        if reloaded:
+            print('Set Cinnamon menu hotkey to Ctrl+Escape (for Cmd+Space) '
+                    'and reloaded the menu applet. Should work immediately.')
+        else:
+            # File written correctly but the running applet could not be
+            # reloaded live; Cinnamon re-reads its settings on next login.
+            cnfg.should_reboot = True
+            print('Set Cinnamon menu hotkey to Ctrl+Escape (for Cmd+Space). '
+                    'Takes effect after logout/reboot.')
+    else:
+        # Auto-config did not confirm success; fall back to the manual
+        # instructions so the user can still fix it by hand.
+        _show_cinnamon_menu_hotkey_reminder()
+
+
+def _reload_cinnamon_menu_applet() -> bool:
+    """Ask a running Cinnamon to reload the menu applet so it re-reads its
+    settings and re-registers the overlay-key grab, avoiding a logout.
+    Cinnamon's applet SettingsBase has no file monitor, so an out-of-band
+    write is invisible to the running applet until it reloads.
+
+    Cascades gdbus -> dbus-send -> qdbus (using cnfg.qdbus_cmd, the
+    already-resolved variant name), mirroring do_kwin_reconfigure().
+    Method: org.Cinnamon.ReloadXlet(uuid, type) on /org/Cinnamon.
+    Returns True as soon as one utility dispatches without error."""
+    dbus_dest   = 'org.Cinnamon'
+    dbus_path   = '/org/Cinnamon'
+    dbus_method = 'org.Cinnamon.ReloadXlet'
+    xlet_uuid   = 'menu@cinnamon.org'
+    xlet_type   = 'APPLET'
+
+    commands = ['gdbus', 'dbus-send', cnfg.qdbus_cmd]
+    for cmd in commands:
+        if shutil.which(cmd):
+            break
+    else:
+        error('No expected D-Bus command available. Cannot reload Cinnamon menu applet.')
+        return False
+
+    if shutil.which('gdbus'):
+        try:
+            cmd_lst = ['gdbus', 'call', '--session',
+                        '--dest', dbus_dest,
+                        '--object-path', dbus_path,
+                        '--method', dbus_method,
+                        xlet_uuid, xlet_type]
+            subprocess.run(cmd_lst, check=True, stdout=DEVNULL, stderr=DEVNULL, timeout=10)
+            return True
+        except (subprocess.SubprocessError, OSError) as proc_err:
+            error(f'Problem using "gdbus" to reload Cinnamon menu applet.\n\t{proc_err}')
+
+    if shutil.which('dbus-send'):
+        try:
+            # --print-reply is essential: without it dbus-send is
+            # fire-and-forget and exits 0 even if the method call fails,
+            # which would falsely report success and skip the reboot
+            # prompt the user actually needs.
+            cmd_lst = ['dbus-send', '--session', '--print-reply',
+                        '--type=method_call',
+                        f'--dest={dbus_dest}', dbus_path, dbus_method,
+                        f'string:{xlet_uuid}', f'string:{xlet_type}']
+            subprocess.run(cmd_lst, check=True, stdout=DEVNULL, stderr=DEVNULL, timeout=10)
+            return True
+        except (subprocess.SubprocessError, OSError) as proc_err:
+            error(f'Problem using "dbus-send" to reload Cinnamon menu applet.\n\t{proc_err}')
+
+    if shutil.which(cnfg.qdbus_cmd):
+        try:
+            cmd_lst = [cnfg.qdbus_cmd, dbus_dest, dbus_path, dbus_method,
+                        xlet_uuid, xlet_type]
+            subprocess.run(cmd_lst, check=True, stdout=DEVNULL, stderr=DEVNULL, timeout=10)
+            return True
+        except (subprocess.SubprocessError, OSError) as proc_err:
+            error(f'Problem using "{cnfg.qdbus_cmd}" to reload Cinnamon menu applet.\n\t{proc_err}')
+
+    error('Failed to reload Cinnamon menu applet. No available D-Bus utility worked.')
+    return False
+
+
+def remove_tweaks_Cinnamon():
+    """Utility function to remove the tweaks applied to Cinnamon: restore
+    the menu applet's overlay-key primary to Super_L, but only where it is
+    still our Ctrl+Escape binding (a user's own later choice is left
+    alone). Mirror image of the apply-time auto-config."""
+    changed = _rebind_cinnamon_overlay_primary(
+        _CINN_OVERLAY_DEFAULT, only_if_primary=_CINN_OVERLAY_TARGET)
+    if changed:
+        _reload_cinnamon_menu_applet()
+        print('Restored Cinnamon menu hotkey to default (Super_L).')
+    else:
+        print('Cinnamon menu hotkey left as-is '
+                '(not our binding, or no menu applet found).')
+
+
+# Cinnamon menu applet overlay-key: the launcher hotkey lives in the menu
+# applet's per-instance Spices JSON (NOT a gsettings schema):
+#   ~/.config/cinnamon/spices/menu@cinnamon.org/<instance-id>.json
+# (legacy: ~/.cinnamon/configs/menu@cinnamon.org/). Value is a
+# '::'-separated alternate list; default 'Super_L::Super_R'. Toshy sets
+# the primary alternate to <Primary>Escape so Cmd+Space -> Ctrl+Escape
+# opens the menu, preserving any secondary.
+_CINN_OVERLAY_TARGET    = '<Primary>Escape'
+_CINN_OVERLAY_DEFAULT   = 'Super_L'
+_CINN_MENU_UUID         = 'menu@cinnamon.org'
+
+
+def _cinn_overlay_instance_files() -> 'list[str]':
+    """Menu applet instance JSON files (current Spices dir first, legacy
+    configs dir as fallback), or [] if none found."""
+    config_home = os.environ.get('XDG_CONFIG_HOME', '') or os.path.join(home_dir, '.config')
+    candidate_dirs_lst = [
+        os.path.join(config_home, 'cinnamon', 'spices', _CINN_MENU_UUID),
+        os.path.join(home_dir, '.cinnamon', 'configs', _CINN_MENU_UUID),
+    ]
+    for spices_dir in candidate_dirs_lst:
+        if not os.path.isdir(spices_dir):
+            continue
+        json_files_lst = [os.path.join(spices_dir, name)
+                            for name in sorted(os.listdir(spices_dir))
+                            if name.endswith('.json')]
+        if json_files_lst:
+            return json_files_lst
+    return []
+
+
+def _rebind_cinnamon_overlay_primary(new_primary, only_if_primary=None) -> bool:
+    """Set the overlay-key primary alternate to new_primary in every menu
+    instance, preserving any secondary. If only_if_primary is given, an
+    instance is changed only when its current primary equals it (used by
+    restore so a user's own later choice is not clobbered). Atomic write
+    per file. Returns True if any file changed."""
+    changed_any = False
+
+    for file_path in _cinn_overlay_instance_files():
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file_obj:
+                data_dct = json.load(file_obj)
+        except (OSError, ValueError):
+            continue
+
+        key_obj = data_dct.get('overlay-key')
+        if not isinstance(key_obj, dict) or 'value' not in key_obj:
+            continue
+
+        current_value = str(key_obj['value'])
+        alternates_lst = current_value.split('::')
+        if only_if_primary is not None and alternates_lst[0] != only_if_primary:
+            continue
+
+        alternates_lst[0] = new_primary
+        new_value = '::'.join(alternates_lst)
+        if new_value == current_value:
+            continue        # idempotent no-op
+
+        key_obj['value'] = new_value
+
+        dir_name = os.path.dirname(file_path)
+        tmp_fd, tmp_path = tempfile.mkstemp(dir=dir_name, suffix='.tmp')
+        try:
+            with os.fdopen(tmp_fd, 'w', encoding='utf-8') as tmp_obj:
+                json.dump(data_dct, tmp_obj, indent=4)
+                tmp_obj.write('\n')
+            os.replace(tmp_path, file_path)
+            changed_any = True
+        except OSError as write_err:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            error(f'Problem writing Cinnamon menu overlay-key:\n\t{write_err}')
+
+    return changed_any
+
+
+def _set_cinnamon_menu_overlay_key() -> 'tuple[bool, bool]':
+    """Rebind the menu applet overlay-key primary to Ctrl+Escape, then
+    confirm the on-disk value and attempt a live applet reload. Returns
+    (confirmed, reloaded): confirmed is True only if every instance now
+    leads with the intended binding; reloaded is True if the live reload
+    dispatched OK (so the caller can skip the reboot prompt)."""
+    _rebind_cinnamon_overlay_primary(_CINN_OVERLAY_TARGET)
+
+    # Confirm: every menu instance must now lead with the target binding.
+    # No instance files means we cannot confirm -> report failure so the
+    # manual dialog handles it.
+    instance_files_lst = _cinn_overlay_instance_files()
+    if not instance_files_lst:
+        return (False, False)
+
+    confirmed_cnt = 0
+    for file_path in instance_files_lst:
+        try:
+            with open(file_path, 'r', encoding='utf-8') as file_obj:
+                data_dct = json.load(file_obj)
+        except (OSError, ValueError):
+            return (False, False)
+        key_obj = data_dct.get('overlay-key')
+        if not isinstance(key_obj, dict) or 'value' not in key_obj:
+            # Not a menu instance settings file (mirrors the rebind
+            # function's leniency); a stray JSON must not fail the check.
+            continue
+        first_alt = str(key_obj['value']).split('::')[0]
+        if first_alt != _CINN_OVERLAY_TARGET:
+            return (False, False)
+        confirmed_cnt += 1
+
+    if confirmed_cnt == 0:
+        return (False, False)
+
+    # Written and confirmed; attempt the live reload (via setup's own
+    # cnfg.qdbus_cmd-based cascade) so the running applet re-registers the
+    # hotkey without requiring a logout.
+    reloaded = _reload_cinnamon_menu_applet()
+    return (True, reloaded)
 
 
 def apply_tweaks_GNOME():
@@ -4808,6 +5452,76 @@ def remove_tweaks_GNOME():
     print(f'Removed tweak to enable more Mac-like task switching')
 
 
+def install_app_switcher_kwin_script():
+    """Install the 'Application Switcher' KWin script.
+
+    Prefers the vendored copy that ships inside the Toshy repo (no network),
+    and falls back to cloning the upstream branch only if the vendored copy
+    is missing. The upstream 'install.sh' handles kpackagetool install/upgrade,
+    enabling the script, and its own KWin reconfigure.
+    """
+
+    switcher_title      = 'KWin Application Switcher'
+
+    print(f'Installing "Application Switcher" KWin script...')
+
+    # Vendored copy is the default source. Synced by 'scripts/sync_vendors.sh'
+    # from the 'kde6_kde5_merged' branch of the repo below.
+    switcher_dir_name   = 'kwin-application-switcher'
+    vendored_dir_path   = os.path.join(this_file_dir, 'vendors', switcher_dir_name)
+    vendored_script     = os.path.join(vendored_dir_path, 'install.sh')
+
+    if os.path.isfile(vendored_script):
+        print(f'Using vendored copy of {switcher_title}.')
+        try:
+            subprocess.run(['bash', './install.sh'], cwd=vendored_dir_path, check=True)
+        except subprocess.CalledProcessError as proc_err:
+            warn(f'Something went wrong installing {switcher_title}.\n\t{proc_err}')
+        return
+
+    # Fallback: vendored copy absent (unusual checkout). Clone from upstream.
+    warn(f'Vendored copy of {switcher_title} not found. Falling back to cloning.')
+
+    # TODO: Revert to nclarius repo if/when this branch is merged.
+    # Patched branch that merges API variations for KDE 5 and 6:
+    # 'https://github.com/RedBearAK/kwin-application-switcher/tree/kde6_kde5_merged'
+    # (includes the fixes from 'grouping_fix' branch)
+    switcher_branch     = 'kde6_kde5_merged'
+    switcher_repo       = 'https://github.com/RedBearAK/kwin-application-switcher.git'
+
+    switcher_dir_path   = os.path.join(this_file_dir, switcher_dir_name)
+    switcher_cloned     = False
+
+    git_clone_cmd_lst   = ['git', 'clone', '--branch']
+    branch_args_lst     = [switcher_branch, switcher_repo, switcher_dir_path]
+
+    # git should be installed by this point? Not necessarily.
+    if not shutil.which('git'):
+        error(f"Unable to clone {switcher_title}. Install 'git' and try again.")
+        return
+
+    if os.path.exists(switcher_dir_path):
+        try:
+            shutil.rmtree(switcher_dir_path)
+        except (FileNotFoundError, PermissionError, OSError) as file_err:
+            warn(f'Problem removing existing switcher clone folder:\n\t{file_err}')
+
+    try:
+        subprocess.run(git_clone_cmd_lst + branch_args_lst, check=True)
+        switcher_cloned = True
+    except subprocess.CalledProcessError as proc_err:
+        warn(f'Problem while cloning the {switcher_title} branch:\n\t{proc_err}')
+
+    if not switcher_cloned:
+        warn(f'Unable to install {switcher_title}. Clone did not succeed.')
+        return
+
+    try:
+        subprocess.run(['bash', './install.sh'], cwd=switcher_dir_path, check=True)
+    except subprocess.CalledProcessError as proc_err:
+        warn(f'Something went wrong installing {switcher_title}.\n\t{proc_err}')
+
+
 def apply_tweaks_KDE():
     """Utility function to add desktop tweaks to KDE"""
 
@@ -4851,63 +5565,22 @@ def apply_tweaks_KDE():
     do_kwin_reconfigure()
 
     if cnfg.fancy_pants or cnfg.app_switcher:
-        print(f'Installing "Application Switcher" KWin script...')
-        # How to install nclarius grouped "Application Switcher" KWin script:
-        # git clone https://github.com/nclarius/kwin-application-switcher.git
-        # cd kwin-application-switcher
-        # ./install.sh
-        #
-        # switcher_url        = 'https://github.com/nclarius/kwin-application-switcher.git'
 
-        # TODO: Revert to main repo if/when patch for this is accepted.
-        # Patched branch that fixes some issues with maintaining grouping:
-        # 'https://github.com/RedBearAK/kwin-application-switcher/tree/grouping_fix'
-
-        # switcher_branch     = 'grouping_fix'
-
-        # TODO: Revert to nclarius repo if/when this branch is merged.
-        # Patched branch that merges API variations for KDE 5 and 6:
-        # 'https://github.com/RedBearAK/kwin-application-switcher/tree/kde6_kde5_merged'
-        # (includes the fixes from 'grouping_fix' branch)
-
-        switcher_branch     = 'kde6_kde5_merged'
-        switcher_repo       = 'https://github.com/RedBearAK/kwin-application-switcher.git'
-
-        switcher_dir_name   = 'kwin-application-switcher'
-        switcher_dir_path   = os.path.join(this_file_dir, switcher_dir_name)
-        switcher_title      = 'KWin Application Switcher'
-        switcher_cloned     = False
-
-        git_clone_cmd_lst   = ['git', 'clone', '--branch']
-        branch_args_lst     = [switcher_branch, switcher_repo, switcher_dir_path]
-
-        # git should be installed by this point? Not necessarily.
-        if not shutil.which('git'):
-            error(f"Unable to clone {switcher_title}. Install 'git' and try again.")
-        else:
-            if os.path.exists(switcher_dir_path):
-                try:
-                    shutil.rmtree(switcher_dir_path)
-                except (FileNotFoundError, PermissionError, OSError) as file_err:
-                    warn(f'Problem removing existing switcher clone folder:\n\t{file_err}')
-            try:
-                subprocess.run(git_clone_cmd_lst + branch_args_lst, check=True)
-                switcher_cloned = True
-            except subprocess.CalledProcessError as proc_err:
-                warn(f'Problem while cloning the {switcher_title} branch:\n\t{proc_err}')
-            if not switcher_cloned:
-                warn(f'Unable to install {switcher_title}. Clone did not succeed.')
-            else:
-                try:
-                    subprocess.run(["./install.sh"], cwd=switcher_dir_path, check=True) #,
-                                    # stdout=DEVNULL, stderr=DEVNULL)
-                    # print(f'Installed "{switcher_title}" KWin script.')
-                except subprocess.CalledProcessError as proc_err:
-                    warn(f'Something went wrong installing {switcher_title}.\n\t{proc_err}')
+        install_app_switcher_kwin_script()
 
         do_kwin_reconfigure()
 
-        fix_task_switcher_cmd = ['./scripts/plasma-task-switcher-fixer.sh']
+        fix_task_switcher_cmd = [
+            os.path.join(this_file_dir, 'scripts', 'plasma-task-switcher-fixer.sh')]
+        try:
+            subprocess.run(fix_task_switcher_cmd, check=True)
+        except subprocess.CalledProcessError as proc_err:
+            error(f'Problem fixing the Plasma task switcher via script.\n\t{proc_err}')
+
+        do_kwin_reconfigure()
+
+        fix_task_switcher_cmd = [
+            os.path.join(this_file_dir, 'scripts', 'plasma-task-switcher-fixer.sh')]
         try:
             subprocess.run(fix_task_switcher_cmd, check=True)
         except subprocess.CalledProcessError as proc_err:
@@ -4974,32 +5647,82 @@ def install_coding_font():
     # Created from spinda no-ligatures fork by processing with Nerd Font script.
     # Original repo: https://github.com/spinda/fantasque-sans-ligatures
     font_file               = 'FantasqueSansMNoLig_Nerd_Font.zip'
-    font_url                = 'https://github.com/RedBearAK/FantasqueSansMNoLigNerdFont/raw/main'
+    # Direct raw host avoids the github.com -> raw.githubusercontent.com redirect hop.
+    font_url    = 'https://raw.githubusercontent.com/RedBearAK/FantasqueSansMNoLigNerdFont/main'
     font_link               = f'{font_url}/{font_file}'
     zip_path                = f'{cnfg.run_tmp_dir}/{font_file}'
 
     print(f'  Downloading… ', end='', flush=True)
 
-    cannot_download_font    = False
-    if shutil.which('curl'):
-        subprocess.run(['curl', '-Lo', zip_path, font_link], stdout=DEVNULL, stderr=DEVNULL)
-    elif shutil.which('wget'):
-        subprocess.run(['wget', '-O', zip_path, font_link], stdout=DEVNULL, stderr=DEVNULL)
-    else:
+    curl_path               = shutil.which('curl')
+    wget_path               = shutil.which('wget')
+
+    if not curl_path and not wget_path:
         error("\nERROR: Neither the 'curl' nor 'wget' utils are available. Cannot download font.")
-        cannot_download_font = True
+        return
 
-    if not cannot_download_font and os.path.isfile(zip_path):
+    # Flags below are supported by all curl versions we care about. The newer
+    # '--retry-all-errors' (curl >= 7.71) is added separately so it can be
+    # dropped on older curl. '-f' makes curl fail on HTTP errors instead of
+    # saving an error page that would later crash the zip extractor.
+    curl_base_cmd = [
+        '-fL', '--retry', '5', '--retry-delay', '2',
+        '--connect-timeout', '20', '-o', zip_path, font_link,
+    ]
 
-        print(f'Unzipping… ', end='', flush=True)
+    font_downloaded = False
 
-        final_folder_name       = None
-        fallback_folder_name    = font_file.rsplit('.', 1)[0]
-        local_fonts_dir         = os.path.join(home_dir, '.local', 'share', 'fonts')
-        extract_dir             = f'{local_fonts_dir}/' # extract directly to local fonts folder
+    if curl_path:
+        # curl exits 2 on an unrecognized command-line option, and only then.
+        # Real transfer failures use other codes (22 for HTTP errors under -f,
+        # 6/7/28 for resolve/connect/timeout), so an exit of 2 specifically
+        # means this curl is too old for '--retry-all-errors'; retry without it.
+        curl_result = subprocess.run(
+            [curl_path, '--retry-all-errors', *curl_base_cmd],
+            stdout=DEVNULL, stderr=DEVNULL,
+        )
+        if curl_result.returncode == 2:
+            curl_result = subprocess.run(
+                [curl_path, *curl_base_cmd],
+                stdout=DEVNULL, stderr=DEVNULL,
+            )
+        font_downloaded = curl_result.returncode == 0
 
+    if not font_downloaded and wget_path:
+        wget_result = subprocess.run(
+            [wget_path, '--tries=5', '--waitretry=2', '--timeout=20',
+                '-O', zip_path, font_link],
+            stdout=DEVNULL, stderr=DEVNULL,
+        )
+        font_downloaded = wget_result.returncode == 0
+
+    if not font_downloaded or not os.path.isfile(zip_path):
+        error("\nERROR: Failed to download the coding font. Skipping font install.")
+        return
+
+    # Validate the archive before trusting it. A truncated transfer or an
+    # unexpected error page must never reach the extractor.
+    if not zipfile.is_zipfile(zip_path):
+        error("\nERROR: Downloaded font file is not a valid zip archive. Skipping font install.")
+        return
+
+    print(f'Unzipping… ', end='', flush=True)
+
+    final_folder_name       = None
+    fallback_folder_name    = font_file.rsplit('.', 1)[0]
+    local_fonts_dir         = os.path.join(home_dir, '.local', 'share', 'fonts')
+    extract_dir             = f'{local_fonts_dir}/' # extract directly to local fonts folder
+
+    try:
         # Open the zip file and check if it has a top-level directory
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+
+            # Thorough integrity check: CRC every entry before extracting.
+            first_bad_entry = zip_ref.testzip()
+            if first_bad_entry is not None:
+                error(f"\nERROR: Font archive is corrupt (bad entry: '{first_bad_entry}'). "
+                        f"Skipping font install.")
+                return
 
             # Get the first part of each path in the zip file
             top_dirs = {name.split('/')[0] for name in zip_ref.namelist()}
@@ -5015,78 +5738,83 @@ def install_coding_font():
                 final_folder_name = list(top_dirs)[0]
 
             os.makedirs(extract_dir, exist_ok=True)
-            zip_ref.extractall(extract_dir)
 
-        print(f'Refreshing font cache… ', end='', flush=True)
+            # Never extract directly onto existing font files. Running apps
+            # (Konsole, etc.) mmap active font files, and truncate-and-rewrite
+            # of the same inode makes them read garbage or take a SIGBUS.
+            # Extract into a hidden temp dir INSIDE the fonts tree (same
+            # filesystem, so rename is atomic; leading dot hides partial
+            # files from fontconfig), then os.replace() each file into place.
+            # The old inode survives for any process still mapping it.
+            tmp_extract_dir = tempfile.mkdtemp(
+                dir=local_fonts_dir, prefix='.toshy_font_tmp_')
 
-        # Update the font cache after putting the font files in place
-        # Any open applications will still need to be restarted to see a new font
-        cmd_lst = ['fc-cache', '-f', '-v']
-        try:
-            subprocess.run(cmd_lst, stdout=DEVNULL, stderr=DEVNULL)
-            print(f'Done.', flush=True)
-        except subprocess.CalledProcessError as proc_err:
-            error(f"\nERROR: Problem while attempting to refresh font cache:\n  {proc_err}")
+            try:
+                zip_ref.extractall(tmp_extract_dir)
 
-        final_folder_path = os.path.join(extract_dir, final_folder_name)
-        print(f"Installed font into location:\n  '{final_folder_path}'")
+                for walk_root, _walk_dirs, walk_files in os.walk(tmp_extract_dir):
+                    rel_dir     = os.path.relpath(walk_root, tmp_extract_dir)
+                    dest_dir    = os.path.normpath(os.path.join(extract_dir, rel_dir))
+                    os.makedirs(dest_dir, exist_ok=True)
+                    for file_name in walk_files:
+                        # os.replace() is an atomic rename on the same
+                        # filesystem and raises OSError (EXDEV) rather than
+                        # silently degrading to copy+delete like shutil.move().
+                        os.replace(
+                            os.path.join(walk_root, file_name),
+                            os.path.join(dest_dir, file_name)
+                        )
+            finally:
+                shutil.rmtree(tmp_extract_dir, ignore_errors=True)
+
+    except zipfile.BadZipFile as zip_err:
+        error(f"\nERROR: Could not read the font archive: {zip_err}. Skipping font install.")
+        return
+
+    print(f'Refreshing font cache… ', end='', flush=True)
+
+    # Update the font cache after putting the font files in place
+    # Any open applications will still need to be restarted to see a new font
+    cmd_lst = ['fc-cache', '-f', '-v']
+    try:
+        subprocess.run(cmd_lst, stdout=DEVNULL, stderr=DEVNULL)
+        print(f'Done.', flush=True)
+    except subprocess.CalledProcessError as proc_err:
+        error(f"\nERROR: Problem while attempting to refresh font cache:\n  {proc_err}")
+
+    final_folder_path = os.path.join(extract_dir, final_folder_name)
+    print(f"Installed font into location:\n  '{final_folder_path}'")
+    print(  "If font files were updated, running apps keep using the old version.\n"
+            "  Restart terminals/browsers to pick up the new font files.")
 
 
 def _show_cinnamon_menu_hotkey_reminder():
     """
     Show a reminder about configuring the Cinnamon menu hotkey for Cmd+Space.
 
-    Checks if the menu applet is using default Super_L shortcut, and if so,
-    shows instructions for manually configuring it to work with Toshy.
+    Checks the menu applet instance settings (current Spices path, legacy
+    path fallback, via _cinn_overlay_instance_files) and shows manual
+    instructions only if no instance is bound to Ctrl+Escape in either
+    GTK spelling ('<Primary>Escape' as we write it, '<Control>Escape' as
+    older manual configuration produced). Defaults to showing the
+    reminder if the settings cannot be read.
     """
-    import json
-
-    menu_uuid = 'menu@cinnamon.org'
-    configs_dir = os.path.join(home_dir, '.cinnamon', 'configs', menu_uuid)
     needs_reminder = True  # Default to showing reminder if checks fail
 
-    # Get enabled applets to find the menu instance ID(s)
-    try:
-        result = subprocess.run(
-            ['gsettings', 'get', 'org.cinnamon', 'enabled-applets'],
-            capture_output=True, text=True, check=True
-        )
-        enabled_applets_str = result.stdout.strip()
-    except subprocess.CalledProcessError:
-        enabled_applets_str = ''
-
-    # Parse the applet list to find menu@cinnamon.org instance IDs
-    # Format: 'panel1:left:0:menu@cinnamon.org:23'
-    instance_ids = []
-
-    if enabled_applets_str.startswith('[') and enabled_applets_str.endswith(']'):
-        applet_entries = enabled_applets_str[1:-1].split(', ')
-        for entry in applet_entries:
-            entry = entry.strip().strip("'")
-            if menu_uuid in entry:
-                parts = entry.split(':')
-                if len(parts) >= 5:
-                    instance_ids.append(parts[-1])
-
-    # Check if any menu applet still has default shortcut (needs configuration)
-    for instance_id in instance_ids:
-        config_file = os.path.join(configs_dir, f'{instance_id}.json')
-
-        if not os.path.isfile(config_file):
-            continue
-
+    for config_file in _cinn_overlay_instance_files():
         try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config = json.load(f)
+            with open(config_file, 'r', encoding='utf-8') as file_obj:
+                config = json.load(file_obj)
         except (json.JSONDecodeError, OSError):
             continue
 
         overlay_key_value = ''
-        if 'overlay-key' in config:
-            overlay_key_value = config['overlay-key'].get('value', '')
+        if 'overlay-key' in config and isinstance(config['overlay-key'], dict):
+            overlay_key_value = str(config['overlay-key'].get('value', ''))
 
-        # Check if already configured for Toshy (has <Control>Escape)
-        if '<Control>Escape' in overlay_key_value:
+        # Already configured for Toshy if any alternate is Ctrl+Escape.
+        if ('<Primary>Escape' in overlay_key_value
+                or '<Control>Escape' in overlay_key_value):
             needs_reminder = False
             break
 
@@ -5200,6 +5928,10 @@ def remove_desktop_tweaks():
     if cnfg.DESKTOP_ENV == 'kde':
         print(f'Removing KDE Plasma desktop tweaks...')
         remove_tweaks_KDE()
+
+    if cnfg.DESKTOP_ENV == 'cinnamon':
+        print(f'Removing Cinnamon desktop tweaks...')
+        remove_tweaks_Cinnamon()
 
     print('Removed known desktop tweaks applied by installer.')
     show_task_completed_msg()
@@ -5330,15 +6062,27 @@ def uninstall_toshy():
 def run_install_sequence(cnfg: InstallerSettings):
     """Main installer function to call specific functions in proper sequence"""
 
+    ask_admin_capability()
+
     if not cnfg.prep_only:
         dot_Xmodmap_warning()
 
-    ask_is_distro_updated()
-
-    if not cnfg.prep_only:
-        ask_add_home_local_bin()
+    # ask_is_distro_updated()
+    #
+    # Skip the "system updated?" prompt when bootstrap already handled it
+    # (--skip-update-check), or on a reinstall (existing ~/.config/toshy folder).
+    # A fresh install run directly from the zip still gets asked.
+    if cnfg.skip_update_check:
+        debug('Skipping "system updated?" prompt: handled by bootstrap (--skip-update-check).')
+    elif os.path.exists(cnfg.toshy_dir_path):
+        debug('Skipping "system updated?" prompt: existing Toshy config found (reinstall).')
+    else:
+        ask_is_distro_updated()
 
     get_environment_info()
+
+    if cnfg.DISTRO_ID == 'nixos':
+        exit_with_nixos_guidance()
 
     if cnfg.DISTRO_ID not in get_supported_distro_ids_lst():
         exit_with_invalid_distro_error()
@@ -5386,11 +6130,12 @@ def run_install_sequence(cnfg: InstallerSettings):
         safe_shutdown(0)
 
     elif not cnfg.prep_only:
-        clone_keymapper_branch()
+        preflight_keymapper_source()
 
         backup_toshy_config()
         install_toshy_files()
 
+        prep_keymapper_files()
         setup_python_vir_env()
         install_pip_packages()
 
@@ -5477,6 +6222,168 @@ def run_install_sequence(cnfg: InstallerSettings):
     safe_shutdown(0)
 
 
+def run_user_files_sequence(cnfg: InstallerSettings):
+    """Set up only the user-level files and services for Toshy.
+
+    Installs no native packages, creates no Python virtual environment, and
+    makes no system-level changes (udev rules, groups, uinput module). Meant
+    for systems where the Python runtime and system setup are managed
+    externally, such as NixOS with a Nix-provided runtime linked at:
+        ${XDG_STATE_HOME:-~/.local/state}/toshy/runtime
+    (Absent that link, launchers still expect the default venv location.)
+    """
+
+    # A venv inside the config folder can only have been created by the normal
+    # install path, meaning the keymapper and all pip dependencies live in a
+    # layer this command never updates. Shipping new user files against a stale
+    # runtime is a version-coupling trap, so refuse outright.
+    # NOTE: If this gate is ever relaxed, the venv MUST be stashed aside around
+    # backup/install below: install_toshy_files() removes the whole config
+    # folder, and backups deliberately exclude the venv. Without a stash this
+    # command would delete the venv and leave nothing to recreate it.
+    venv_dir_path = os.path.join(cnfg.toshy_dir_path, '.venv')
+    if os.path.isdir(venv_dir_path):
+        print()
+        error(f'ERROR: Found a Python venv inside the Toshy config folder:')
+        error(f'    {venv_dir_path}')
+        print()
+        print(
+            'This system appears to use the normal install path. The venv holds\n'
+            'the keymapper and all Python dependencies, and this command would\n'
+            'not update any of that, leaving new user files coupled to a stale\n'
+            'runtime. Run the full install instead:\n'
+            f'\n    ./{this_file_name} install\n'
+        )
+        safe_shutdown(1)
+
+    # With no venv allowed, the runtime must already be provided externally,
+    # or everything this command installs (services, launchers, autostart)
+    # would be inert. Mirror the launcher seam's resolution: the env var
+    # first, then the state-dir link — where a link that exists in any form
+    # (even dangling) counts as "configured" and must be valid.
+    runtime_dir_path = os.environ.get('TOSHY_RUNTIME_DIR')
+    runtime_src_desc = 'TOSHY_RUNTIME_DIR environment variable'
+    if not runtime_dir_path:
+        state_dir_path      = os.environ.get('XDG_STATE_HOME') or os.path.join(
+                                home_dir, '.local', 'state')
+        runtime_link_path   = os.path.join(state_dir_path, 'toshy', 'runtime')
+        if os.path.lexists(runtime_link_path):
+            runtime_dir_path = runtime_link_path
+            runtime_src_desc = f'runtime link: {runtime_link_path}'
+
+    if not runtime_dir_path:
+        print()
+        error(f'ERROR: No externally managed Python runtime was found.')
+        print()
+        print(
+            'This command installs only user-level files, and requires the\n'
+            'runtime to already exist. It looked for the TOSHY_RUNTIME_DIR\n'
+            'environment variable, then for a runtime link at:\n'
+            '\n    ${XDG_STATE_HOME:-~/.local/state}/toshy/runtime\n'
+            '\n'
+            'On NixOS, a missing link means the Nix flake / home-manager module\n'
+            'that is responsible for creating it has not been applied, or did\n'
+            'not work. Set that up first, then run this command again.\n'
+            '\n'
+            'On other distros, this is probably not the command you want:\n'
+            f'\n    ./{this_file_name} install\n'
+        )
+        safe_shutdown(1)
+
+    runtime_python_path = os.path.join(runtime_dir_path, 'bin', 'python')
+    if not os.access(runtime_python_path, os.X_OK):
+        print()
+        error(f'ERROR: The external runtime is configured but broken.')
+        error(f'    Selected via: {runtime_src_desc}')
+        error(f'    Expected interpreter at: {runtime_python_path}')
+        print()
+        print(
+            'This usually means a dangling symlink or a path that is not a\n'
+            'Python environment. Fix the external runtime setup (on NixOS,\n'
+            're-apply the flake / home-manager configuration) before\n'
+            'installing the user-level files.\n'
+        )
+        safe_shutdown(1)
+
+    dot_Xmodmap_warning()
+
+    get_environment_info()
+
+    # Deliberately no supported-distro gate here: nothing below involves a
+    # native package manager, so unknown distro IDs (e.g. 'nixos') are fine.
+
+    if cnfg.DESKTOP_ENV == 'gnome' and cnfg.SESSION_TYPE == 'wayland':
+        check_gnome_wayland_exts()
+
+    if cnfg.DESKTOP_ENV == 'gnome':
+        check_gnome_indicator_ext()
+
+    app_switcher_kwin_compat = cnfg.DESKTOP_ENV == 'kde' and cnfg.DE_MAJ_VER in ['5', '6']
+    if app_switcher_kwin_compat and not cnfg.fancy_pants:
+        # Need to limit this check to the versions of KDE Plasma
+        # that are actually compatible with the KWin script (5/6).
+        check_kde_app_switcher()
+
+    backup_toshy_config()
+    install_toshy_files()
+
+    install_bin_commands()
+    install_desktop_apps()
+
+    # Python D-Bus service script also does this, but this will refresh if script changes
+    if cnfg.DESKTOP_ENV in ['kde', 'plasma']:
+        setup_kwin_dbus_script()
+
+    # Some users might still have an older KWin D-Bus service desktop autostart file
+    cleanup_legacy_kwin_dbus_autostart()
+
+    setup_systemd_services()
+
+    autostart_systemd_kickstarter()
+
+    autostart_tray_icon()
+    apply_desktop_tweaks()
+
+    input_group_warned = warn_if_missing_input_group()
+
+    tray_restarted = False
+    if not input_group_warned and cnfg.autostart_tray_icon:
+        # Replace any running tray instance with the freshly installed one. The
+        # tray app itself terminates a pre-existing instance on startup (via
+        # ProcessManager), so launching it is the whole "restart" mechanism.
+        tray_icon_cmd = [os.path.join(home_dir, '.local', 'bin', 'toshy-tray')]
+        subprocess.Popen(tray_icon_cmd, close_fds=True, stdout=DEVNULL, stderr=DEVNULL)
+        tray_restarted = True
+
+    lb = cnfg.sep_char * 2      # shorter variable name for left border chars
+
+    print()
+    print(cnfg.separator)
+    print(cnfg.separator)
+    print(f'{lb}  Toshy user-files setup complete. Report issues on the GitHub repo.')
+    print(f'{lb}  https://github.com/RedBearAK/toshy/issues/')
+    print(f'{lb}  >>  REMINDER: This command did NOT set up a Python runtime, udev')
+    print(f'{lb}  >>  rules, or group membership. Those are managed externally.')
+    if input_group_warned:
+        print(f'{lb}  >>  Once group membership and udev rules are in place, you must')
+        print(f'{lb}  >>  log out and back in (or reboot) before Toshy can work.')
+    if tray_restarted:
+        print(f'{lb}  Tray icon has been (re)started with the updated files.')
+    elif cnfg.autostart_tray_icon:
+        print(f'{lb}  Tray icon will appear at the next login. (Or run "toshy-tray" now.)')
+    print(cnfg.separator)
+    print(cnfg.separator)
+    print()
+
+    if cnfg.SESSION_TYPE == 'wayland' and cnfg.DESKTOP_ENV == 'kde':
+        print(f'Switch to a different window ONCE to get KWin script to start working!')
+
+    if cnfg.remind_extensions or (cnfg.DESKTOP_ENV == 'gnome' and cnfg.SESSION_TYPE == 'wayland'):
+        print(f'You MUST install GNOME EXTENSIONS if using Wayland+GNOME! See Toshy README.')
+
+    safe_shutdown(0)
+
+
 def main():
     """Deal with CLI arguments given to installer script"""
     parser = argparse.ArgumentParser(
@@ -5535,12 +6442,38 @@ def main():
         help='See README for more info on this option.'
     )
     subparser_install.add_argument(
+        '--skip-update-check',
+        action='store_true',
+        help=argparse.SUPPRESS,     # internal handshake from bootstrap.sh (hidden)
+    )
+
+    subparser_install.add_argument(
+        '--admin-capable',
+        choices=['yes', 'no'],
+        help=argparse.SUPPRESS      # internal latch, passed by bootstrap.sh
+    )
+    subparser_install.add_argument(
         '--unprivileged-user',
         default=False,
         action='store_true',
         help='Skip installation steps requiring elevated permissions'
     )
 
+    subparser_user_files        = subparsers.add_parser(
+        'install-user-files',
+        help='Install only user-level files/services (runtime/system managed externally)'
+    )
+
+    subparser_user_files.add_argument(
+        '--barebones-config',
+        action='store_true',
+        help='Install with mostly empty/blank keymapper config file.'
+    )
+    subparser_user_files.add_argument(
+        '--fancy-pants',
+        action='store_true',
+        help='See README for more info on this option.'
+    )
 
     subparser_list_distros      = subparsers.add_parser(
         'list-distros',
@@ -5579,6 +6512,12 @@ def main():
         help='Do only prep steps that require admin privileges, no install'
     )
 
+    subparser_prep_only.add_argument(
+        '--admin-capable',
+        choices=['yes', 'no'],
+        help=argparse.SUPPRESS      # internal latch, passed by bootstrap.sh
+    )
+
     subparser_uninstall         = subparsers.add_parser(
         'uninstall',
         help='Uninstall Toshy'
@@ -5594,6 +6533,8 @@ def main():
 
     elif args.command == 'prep-only':
         cnfg.prep_only = True
+        if args.admin_capable:
+            cnfg.admin_capable_answer = 'y' if args.admin_capable == 'yes' else 'n'
 
         run_install_sequence(cnfg)
         safe_shutdown(0)    # redundant, but that's OK
@@ -5613,6 +6554,12 @@ def main():
         if args.skip_native:
             cnfg.skip_native = True
 
+        if args.admin_capable:
+            cnfg.admin_capable_answer = 'y' if args.admin_capable == 'yes' else 'n'
+
+        if args.skip_update_check:
+            cnfg.skip_update_check = True
+
         if args.no_dbus_python:
             cnfg.no_dbus_python = True
 
@@ -5630,6 +6577,16 @@ def main():
         run_install_sequence(cnfg)
         safe_shutdown(0)    # redundant, but that's OK
 
+    elif args.command == 'install-user-files':
+        if args.barebones_config:
+            cnfg.barebones_config = True
+
+        if args.fancy_pants:
+            cnfg.fancy_pants = True
+
+        run_user_files_sequence(cnfg)
+        safe_shutdown(0)    # redundant, but that's OK
+
     elif args.command == 'list-distros':
         print(
             f'Index of distro IDs known to the Toshy installer:\n'
@@ -5641,6 +6598,9 @@ def main():
             f'\n'
             f'\n * Number of supported variants of base distros is higher than IDs.'
             f'\n   Many variants still use the same distro ID as their base distro.'
+            f'\n'
+            f'\n ^ Distro uses its own dedicated install path.'
+            f'\n   See distro-specific docs (e.g. "nix/README.md" for NixOS).'
         )
         safe_shutdown(0)
 

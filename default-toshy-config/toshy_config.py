@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__version__ = '20260621'
+__version__ = '20260726'
 ###############################################################################
 ############################   Welcome to Toshy!   ############################
 ###
@@ -17,21 +17,18 @@ __version__ = '20260621'
 ###
 ###############################################################################
 
-import re
 import os
+import re
 import sys
 import time
 import shutil
-import asyncio
 import inspect
 import textwrap
 import subprocess
 
 # Removing problematic types before they get deprecated:
 # from typing import Any, Callable, Optional, Union, List, Dict, Tuple
-from typing import Any
 from subprocess import DEVNULL
-from collections.abc import Callable
 
 from xwaykeyz.config_api import *
 from xwaykeyz.lib.key_context import KeyContext
@@ -48,8 +45,15 @@ emergency_eject_key(Key.F16)    # default key: F16
 
 timeouts(
     multipurpose        = 1,        # default: 1 sec
-    suspend             = 1,        # default: 1 sec, try 0.1 sec for touchpads/trackpads
+    suspend             = 0,        # default: 0 sec
+    # A `name=` argument exists (default "global") but is intentionally not
+    # passed here, so this config still loads on older keymapper versions
+    # whose timeouts() signature predates conditional timeout support.
 )
+
+# Conditional per-app timeout overrides are registered further down, in the
+# hoisted `hmp_*` matcher block, once the app-class matcher closures exist.
+# See the "CONDITIONAL TIMEOUTS" section below.
 
 # Delays often needed for Wayland and/or virtual machines or slow systems
 throttle_delays(
@@ -211,11 +215,14 @@ sys.path.insert(0, current_folder_path)
 from toshy_common.env_context           import EnvironmentInfo
 from toshy_common.kblayout_setup        import current_layout_name, start_kblayout_correction
 from toshy_common.machine_context       import get_machine_id_hash
+from toshy_common.modifier_modes        import CAPSLOCK_MODES, CAPSLOCK_MODE_DEFAULT
 from toshy_common.notification_manager  import NotificationManager
 from toshy_common.overlay_context       import OverlayFlag as OFlag
 from toshy_common.proc_launcher         import launch_detached
 from toshy_common.runtime_utils         import sanitize_text
+from toshy_common.screenshots           import setup_screenshot_keymaps
 from toshy_common.settings_class        import Settings
+from toshy_common.spotlight_input       import setup_spotlight_input_keymaps
 from toshy_common.terminal_utils        import render_pango_text
 
 # Start up the mechanism that optionally auto-corrects keycodes that
@@ -697,6 +704,30 @@ browsers_all            = [x.casefold() for x in browsers_all]
 browsers_allStr         = "|".join('^'+x+'$' for x in browsers_all)
 
 
+# Thunderbird and its Betterbird fork have several different app class strings.
+# Betterbird historically reports 'thunderbird-default' because the Mozilla build system
+# ties WM_CLASS to 'moz_app_remotingname', which Betterbird must leave as 'thunderbird'
+# so it takes the Thunderbird code path. Newer builds may report the reverse-DNS form.
+# The same mechanism produces the '-esr' suffix on distro ESR packages.
+thunderbirds = [
+    'thunderbird.*',                    # Catches 'thunderbird-default', 'thunderbird_esr'
+    'org.mozilla.thunderbird.*',        # Flatpak app ID, ESR adds "_esr" on the end
+    'betterbird.*',
+    'eu.betterbird.Betterbird.*',       # Flatpak app ID
+]
+thunderbirds                    = [x.casefold() for x in thunderbirds]
+thunderbirdStr                  = toRgxStr(thunderbirds)
+
+# Compose window title prefix. Localized in non-English builds — a wrong pattern here
+# silently drops the compose window into the non-compose keymap.
+thunderbird_compose_names = [
+    'Write:.*',                         # Current prefix (windowTitlePrefix in composeMsgs.properties)
+    'Compose:.*',                       # Older prefix, pre-Supernova
+]
+thunderbird_compose_names       = [x.casefold() for x in thunderbird_compose_names]
+thunderbird_compose_Str         = toRgxStr(thunderbird_compose_names)
+
+
 # NOTE: Do not be tempted to convert simple app class lists into a "list of dicts"
 # If the list contains only app classes, the regex pattern string is much faster.
 filemanagers = [
@@ -866,6 +897,47 @@ not_win_type_rgx    = re.compile("IBM|Chromebook|Apple", re.I)
 
 # Instantiate a useful notification object class instance, to make notifications easier
 ntfy = NotificationManager(icon_file_active, title='Toshy Alert (Config)')
+
+
+def _purge_legacy_caps_prefs():
+    """One-shot: legacy Caps2Cmd/Caps2Esc_Cmd booleans were replaced by the
+    string-valued 'capslock_mode' setting, with no automatic migration. If a
+    legacy boolean is found set in the prefs DB, notify the user (critical)
+    to re-select their Caps mode, then delete the stale rows. The DELETE
+    makes this idempotent, so any Toshy component may safely call it.
+    Deletable, along with CAPSLOCK_LEGACY_BOOL_NAMES, after a generous
+    deprecation period.
+    """
+    import sqlite3
+    from toshy_common.modifier_modes import CAPSLOCK_LEGACY_BOOL_NAMES
+    try:
+        with sqlite3.connect(cnfg.prefs_db_file_path) as db_connection:
+            db_cursor = db_connection.cursor()
+            placeholders = ','.join('?' * len(CAPSLOCK_LEGACY_BOOL_NAMES))
+            db_cursor.execute(
+                f'SELECT name, value FROM config_preferences WHERE name IN ({placeholders})',
+                CAPSLOCK_LEGACY_BOOL_NAMES)
+            legacy_rows = db_cursor.fetchall()
+            if not legacy_rows:
+                return
+            if any(row_value == 'True' for _, row_value in legacy_rows):
+                ntfy.send_notification(
+                    message=('CapsLock options were consolidated into a single mode '
+                                'selector. Your previous CapsLock setting is no longer '
+                                'active - re-select it in Toshy Preferences.'),
+                    urgency='critical')
+                debug('Legacy CapsLock boolean prefs found set; user notified.')
+            db_cursor.execute(
+                f'DELETE FROM config_preferences WHERE name IN ({placeholders})',
+                CAPSLOCK_LEGACY_BOOL_NAMES)
+            db_connection.commit()
+            debug('Legacy CapsLock boolean prefs purged from prefs DB.')
+    except sqlite3.Error as db_error:
+        # Non-fatal: worst case the one-shot fires again on next config start.
+        error(f'Problem purging legacy CapsLock prefs: {db_error}')
+
+
+_purge_legacy_caps_prefs()
 
 # Boolean variable to toggle Enter key state between F2 and Enter
 # True = Enter key sends F2, False = Enter key sends Enter
@@ -1045,6 +1117,12 @@ def _context_pre_check(ctx: KeyContext):
     ctx_ovl_user_flag_e         = bool(mask & OFlag.USER_FLAG_E)
     ctx_ovl_user_flag_f         = bool(mask & OFlag.USER_FLAG_F)
 
+    # Derive the per-mode ctx_caps_is_* booleans from cnfg.capslock_mode.
+    # Defined inside the modmap scan region (defined later in the file, but
+    # only *called* at runtime, after the whole config has executed) so the
+    # modmap region verifier can drive the real derivation.
+    _update_caps_mode_flags()
+
     # Maintain the Enter-to-rename latch (resets when focus leaves a file manager)
     _get_iEF2_context(ctx)
 
@@ -1117,15 +1195,18 @@ def isDoubleTap(dt_combo):
 
 ###  Hoisted matchProps closures — factory runs once here, not on every key event  ###
 hmp_is_remote                   = matchProps(clas=remoteStr)        # Only needed for diagnostic dlg
-hmp_not_remote                  = matchProps(not_clas=remoteStr)
+# hmp_not_remote                  = matchProps(not_clas=remoteStr)                # not used currently
 hmp_is_terminal                 = matchProps(clas=termStr)
-hmp_not_term_or_remote          = matchProps(not_clas=terms_and_remotes_Str)
+# hmp_not_term_or_remote          = matchProps(not_clas=terms_and_remotes_Str)    # not used currently
 hmp_not_vscode_or_remote        = matchProps(not_clas=vscodes_and_remotes_Str)
 hmp_is_vscode                   = matchProps(clas=vscodeStr)
-hmp_numlk_off                   = matchProps(numlk=False)
+hmp_numlk_off                   = matchProps(numlk=False)           # Used for forced numpad feat.
 hmp_is_browser                  = matchProps(clas=browsers_allStr)
 hmp_is_chrome_browser           = matchProps(clas=browsers_chromeStr)
 hmp_is_firefox_browser          = matchProps(clas=browsers_firefoxStr)
+# hmp_is_thunderbird              = matchProps(clas=thunderbirdStr) # Safer to use compose vs NOT compose hoists (below)
+hmp_is_tbird_compose            = matchProps(clas=thunderbirdStr, name=thunderbird_compose_Str)
+hmp_not_tbird_compose           = matchProps(clas=thunderbirdStr, not_name=thunderbird_compose_Str)
 hmp_is_filemanager              = matchProps(clas=filemanagerStr)
 
 # Hoisted list-of-dicts calls — pre-build inner closures at load time
@@ -1133,6 +1214,40 @@ _dialog_escape_closures         = [matchProps(**dct) for dct in dialogs_Escape_l
 hmp_is_dialog_escape            = lambda ctx: any(c(ctx) for c in _dialog_escape_closures)
 _dialog_closewin_closures       = [matchProps(**dct) for dct in dialogs_CloseWin_lod]
 hmp_is_dialog_closewin          = lambda ctx: any(c(ctx) for c in _dialog_closewin_closures)
+
+
+###################################################################################
+###  CONDITIONAL TIMEOUTS                                                        ###
+###################################################################################
+# The global `timeouts(...)` call near the top sets the baseline. You can also
+# register any number of conditional overrides here, now that the `hmp_*` app
+# matcher closures above exist. Each call takes the same `when=` predicate style
+# as keymaps/modmaps (a callable receiving `ctx`), plus a `name=` used only for
+# logging when that override is applied. First matching rule wins, per key; keys
+# you omit fall through to the global default.
+#
+# Typical use: run a low or zero global `suspend` timeout (best for games and
+# any app that must react the instant a modifier is pressed), then add a longer
+# suspend window back for the few apps that misbehave with a short window (menu
+# focus-stealing in Firefox and VSCode being the classic cases). To do that,
+# set `suspend = 0` in the global `timeouts(...)` call above, then uncomment:
+#
+# timeouts(suspend = 0.3, when = lambda ctx: hmp_is_firefox_browser(ctx),
+#             name = "firefox_menu_guard")
+# timeouts(suspend = 0.3, when = lambda ctx: hmp_is_vscode(ctx),
+#             name = "vscode_menu_guard")
+#
+# The reverse also works: keep a normal global window and drop specific apps to
+# zero. Note that `tap_interval` and `min_tap_delay` are accepted here too
+# (globally or conditionally), but multi-tap has no keymapper-side gate yet,
+# so setting them warns at load and stays inert until that gate lands.
+
+# Menu focus-stealing guards: restore a working suspend window for the apps
+# that grab menu focus on a bare modifier press, while the global suspend
+# timeout stays at zero for instant modifier response everywhere else.
+timeouts(suspend = 1, when = hmp_is_firefox_browser,  name = "firefox_menu_guard")
+timeouts(suspend = 1, when = hmp_is_vscode,           name = "vscode_menu_guard")
+
 
 # # Boolean variable to toggle Enter key state between F2 and Enter
 # # True = Enter key sends F2, False = Enter key sends Enter
@@ -1213,7 +1328,7 @@ def iEF2NT():
 def macro_tester():
     """Type out a macro with useful info and a Unicode test.
         WARNING: Safe only for use in apps that accept text blocks/typing of many characters.
-        Character marker in front of each line is a canary to see if Combo outputs are 
+        Character marker in front of each line is a canary to see if Combo outputs are
         being corrected for the layout, not just strings going through ST()."""
     def _macro_tester(ctx: KeyContext):
         return [
@@ -1319,6 +1434,7 @@ def notify_context():
             f"{nwln_str}"
             f"<b>Input keyboard name:</b> '{ctx_devn}' {nwln_str}"
             f"<b>Device seen as type:</b> '{KBTYPE}' {nwln_str}"
+            f"<b>Active keybd layout:</b> '{current_layout_name()}' {nwln_str}"
             f"{nwln_str}"
             f"<b>Toshy config file sees this environment:</b>  {nwln_str}"
             f"<b> • DISTRO_ID ____________</b> '{DISTRO_ID      }' {nwln_str}"
@@ -1455,51 +1571,67 @@ def is_pre_GNOME_45(de_ver):
     return str(de_ver).isdigit() and int(de_ver) in pre_G45_ver_lst
 
 
+def _report_capslock_state(ctx: KeyContext):
+    """Reporter half of toggle_and_show_capslock_state(). Runs after the
+    CapsLock combo has been fully emitted, so the LED read reflects the
+    settled post-toggle state. Not for direct use in keymaps."""
+    message = 'CapsLock is now ON' if ctx.capslock_on else 'CapsLock is now OFF'
+    icon = 'input-caps-on-symbolic' if ctx.capslock_on else 'window-close'
+    ntfy.send_notification(message, icon, 'low', False)
+
+
+def _report_numlock_state(ctx: KeyContext):
+    """Reporter half of toggle_and_show_numlock_state(). Runs after the
+    NumLock combo has been fully emitted, so the LED read reflects the
+    settled post-toggle state. Not for direct use in keymaps."""
+    message = 'NumLock is now ON' if ctx.numlock_on else 'NumLock is now OFF'
+    icon = 'input-num-on' if ctx.numlock_on else 'window-close'
+    ntfy.send_notification(message, icon, 'low', False)
+
+
 def toggle_and_show_capslock_state(ctx: KeyContext):
     """
-    Show the (coming) state of CapsLock LED in a notification pop-up dialog.
-    Then return the CapsLock key combo to toggle the CapsLock LED state.
+    Toggle CapsLock, then show the resulting LED state in a notification.
 
-    No need to return inner closure because not used in conditionals.
+    Returns a list: the CapsLock combo first, then a reporter function.
+    handle_commands() processes list items in order, so the combo (press,
+    release, throttle delay) is fully emitted before the reporter reads
+    the LED. Ordering matters: XKB locks Caps on key press but unlocks it
+    on key release, so a read taken anywhere mid-tap finds the LED lit in
+    BOTH toggle directions. Reading only after the release makes the
+    report correct whether CapsLock is a plain key or the tap identity
+    of a multipurpose key (e.g. 'caps_is_caps_and_cmd' mode).
+
     Do not use () to 'call' the function from output macro. Not needed.
 
     Example usage:
     C("CapsLock"): toggle_and_show_capslock_state, # Toggle CapsLock, show notification
     """
-
-    # Logic reversed because notification is constructed before combo is returned.
-    message = 'CapsLock is ON' if not ctx.capslock_on else 'CapsLock is OFF'
-    icon = 'input-caps-on-symbolic' if not ctx.capslock_on else 'window-close'
-    ntfy.send_notification(message, icon, 'low', False)
-    return C("CapsLock")
+    return [C("CapsLock"), _report_capslock_state]
 
 
 def toggle_and_show_numlock_state(ctx: KeyContext):
     """
-    Show the (coming) state of NumLock LED in a notification pop-up dialog.
-    Then return the NumLock key combo to toggle the NumLock LED state.
+    Toggle NumLock, then show the resulting LED state in a notification.
 
-    Only shows notification and toggles if 'Forced Numpad' pref is disabled.
-    Like the isNumlockClearKey() function, returns Escape combo if 'Forced
+    Same emit-then-report structure as toggle_and_show_capslock_state();
+    see that docstring for why the ordering is load-bearing.
+
+    Only toggles and notifies if 'Forced Numpad' pref is disabled. Like
+    the isNumlockClearKey() function, returns Escape combo if 'Forced
     Numpad' feature is enabled. 'Forced Numpad' must be disabled to use
     NumLock key normally and see the notifications.
 
-    No need to return inner closure because not used in conditionals.
     Do not use () to 'call' the function from output macro. Not needed.
 
     Example usage:
     C("NumLock"): toggle_and_show_numlock_state, # Toggle NumLock, show notification
     """
-
     if cnfg.forced_numpad:
         debug(f'Force Numpad is ON: NumLock key is "Clear" (sends Escape)')
         return C("Esc")
-    else:
-        # Logic reversed because notification is constructed before combo is returned.
-        message = 'NumLock is ON' if not ctx.numlock_on else 'NumLock is OFF'
-        icon = 'input-num-on' if not ctx.numlock_on else 'window-close'
-        ntfy.send_notification(message, icon, 'low', False)
-        return C("NumLock")
+
+    return [C("NumLock"), _report_numlock_state]
 
 
 
@@ -1525,383 +1657,31 @@ def toggle_and_show_numlock_state(ctx: KeyContext):
 ###                                                                              ###
 ###                                                                              ###
 ####################################################################################
-# Functions to support proper asyncio time-based multi-tap actions, without
-# blocking the single-tap usage of the same combo (unless desired).
+# Multi-tap combo actions now live inside the keymapper. The MultiTap()
+# descriptor class (and its deprecated isMultiTap() alias) arrives through the
+# `from xwaykeyz.config_api import *` star import at the top of this file, and
+# all tap counting, timing, and action emission happens in xwaykeyz.
 #
-# Until this EXPERIMENTAL feature moves into the keymapper, the API function
-# `multitap_config()` will need to be called from a section lower down, like
-# the "user_apps" editable slice, if user wants custom multi-tap timings.
-
-
-# Multi-tap configuration storage
-_MULTITAP_CONFIG = {
-    'tap_interval': 0.25,     # Default: 250ms between taps
-    'min_tap_delay': 0.07,    # Default: 70ms repeat protection
-}
-
-
-def get_output():
-    """Get the main keymapper's output instance"""
-    try:
-        # Access the transform module's _output at runtime
-        if 'xwaykeyz.transform' in sys.modules:
-            transform_module = sys.modules['xwaykeyz.transform']
-            if hasattr(transform_module, '_output'):
-                debug("## multitap: Using main keymapper's _output instance")
-                return transform_module._output
-    except Exception as e:
-        debug(f"## multitap: Error accessing output: {e}")
-    return None
-
-
-def _decorrect_for_multitap(command):
-    """Apply the keymapper's output layout de-correction to a multi-tap command,
-    mirroring what handle_commands does to every command before it reaches output.
-
-    This processor is a parallel reimplementation of handle_commands and so does
-    NOT inherit its de-correction step; without this, a bare Combo/Key emitted by
-    a multi-tap action goes out US-positional and renders the wrong symbol on a
-    non-US layout (e.g. C('Minus') -> ')' on AZERTY), while string-emitter output
-    is unaffected because it is already PreCorrectedCombo.
-
-    The de-correction function and the correction-map probe are read off the live
-    transform module via sys.modules — the same runtime-access pattern get_output
-    uses for _output — so this stays inside toshy_config and adds no import across
-    the keymapper boundary. Gated on a correction map being installed, exactly as
-    handle_commands gates its own call. On any failure, or when no map is present,
-    the command is returned unchanged so multi-tap output is never lost.
-
-    NOTE: this patches the reimplementation. The real fix is to route multi-tap
-    emission through handle_commands so this concern (and any other drift from it)
-    cannot recur; that relocation is tracked separately."""
-    try:
-        transform_module = sys.modules.get('xwaykeyz.transform')
-        if transform_module is None:
-            return command
-        get_correction_map = getattr(transform_module, 'get_correction_map', None)
-        decorrect_command = getattr(transform_module, '_decorrect_output_command', None)
-        if get_correction_map is None or decorrect_command is None:
-            return command
-        if not get_correction_map():
-            return command                  # US-like layout: nothing to de-correct
-        return decorrect_command(command)
-    except Exception as decorrect_err:
-        debug(f"## multitap: de-correction skipped ({decorrect_err})")
-        return command
-
-
-def process_multitap_command(command, ctx):
-    """Simplified recursive command processor based on handle_commands logic"""
-    debug(f"## multitap: Processing command: {type(command)}")
-
-    if callable(command):
-        # Handle functions like ST(), notify_context, etc.
-        cmd_param_cnt = len(inspect.signature(command).parameters)
-        debug(f"## multitap: Callable with {cmd_param_cnt} parameters")
-
-        if cmd_param_cnt == 0:
-            result = command()
-        else:
-            result = command(ctx)
-
-        debug(f"## multitap: Callable returned: {type(result)}")
-
-        # Recursively process the result
-        if result is not None:
-            process_multitap_command(result, ctx)
-
-    elif isinstance(command, list):
-        # Recursively process each item in the list
-        debug(f"## multitap: Processing list with {len(command)} items")
-        for i, item in enumerate(command):
-            debug(f"## multitap: Processing list item {i+1}: {type(item)}")
-            process_multitap_command(item, ctx)
-
-    else:
-        # Handle direct objects (Combo, Key, etc.)
-        output = get_output()
-        if output and hasattr(command, '__class__'):
-            # De-correct for the active layout before emitting, the same way
-            # handle_commands does (de-correct, then dispatch). Leaves a
-            # PreCorrectedCombo untouched and returns the same kind of object, so
-            # the class-name dispatch below still classifies it correctly.
-            command = _decorrect_for_multitap(command)
-            class_name = command.__class__.__name__
-            debug(f"## multitap: Direct object class: {class_name}")
-
-            if 'Combo' in class_name:
-                output.send_combo(command)
-                debug(f"## multitap: Sent Combo object")
-            elif 'Key' in class_name:
-                output.send_key(command)
-                debug(f"## multitap: Sent Key object")
-            elif command is not None:
-                debug(f"## multitap: Unknown command type: {class_name}")
-        elif not output:
-            debug(f"## multitap: No output available for command: {type(command)}")
-        else:
-            debug(f"## multitap: Command has no __class__: {command}")
-
-
-# Per-combo state tracking using action tuple as key
-tap_states: 'dict[tuple, dict[str, Any]]' = {}
-
-event_loop: 'asyncio.AbstractEventLoop | None' = None
-
-
-def get_loop() -> 'asyncio.AbstractEventLoop | None':
-    global event_loop
-    if event_loop is None or event_loop.is_closed():
-        try:
-            event_loop = asyncio.get_running_loop()
-        except RuntimeError:
-            event_loop = None
-    return event_loop
+# Multi-tap timing values are now ordinary timeout keys. Set them globally or
+# per-condition with the overloaded keymapper API call:
+#
+#   timeouts(tap_interval=0.3, min_tap_delay=0.1)                   # global
+#   timeouts(tap_interval=0.4, when=lambda ctx: ..., name="slower") # per-app
+#
+# Defaults: tap_interval 0.25 sec, min_tap_delay 0.07 sec.
 
 
 def multitap_config(tap_interval=None, min_tap_delay=None):
+    """DEPRECATED shim retained for user config slices that call it.
+
+    Multi-tap timing now goes through the keymapper's timeouts() API; this
+    simply forwards the two values at global scope. The keymapper validates
+    the ranges (tap_interval 0.15-1.5 sec, min_tap_delay 0.05-0.5 sec) and
+    clamps min_tap_delay below tap_interval, as this function used to.
     """
-    Configure global multi-tap timing settings.
-
-    Args:
-        tap_interval: Maximum time between taps in seconds (0.15 to 1.5)
-        min_tap_delay: Minimum time between taps to avoid repeats (0.05 to 0.5)
-
-    Example:
-        multitap_config(
-            tap_interval=0.3,    # 300ms between taps
-            min_tap_delay=0.10   # 100ms repeat protection
-        )
-    """
-    global _MULTITAP_CONFIG
-
-    if tap_interval is not None:
-        if isinstance(tap_interval, (int, float)) and 0.15 <= tap_interval <= 1.5:
-            _MULTITAP_CONFIG['tap_interval'] = float(tap_interval)
-            debug(f"## multitap_config: Set tap_interval to {tap_interval}s")
-        else:
-            debug(f"## multitap_config: Invalid tap_interval {tap_interval}, must be 0.15-1.5 sec")
-
-    if min_tap_delay is not None:
-        if isinstance(min_tap_delay, (int, float)) and 0.05 <= min_tap_delay <= 0.5:
-            _MULTITAP_CONFIG['min_tap_delay'] = float(min_tap_delay)
-            debug(f"## multitap_config: Set min_tap_delay to {min_tap_delay}s")
-        else:
-            debug(f"## multitap_config: Invalid min_tap_delay {min_tap_delay}, must be 0.05-0.5 sec")
-
-    # Ensure ignore time is less than interval time
-    if _MULTITAP_CONFIG['min_tap_delay'] >= _MULTITAP_CONFIG['tap_interval']:
-        original_delay = _MULTITAP_CONFIG['min_tap_delay']
-        _MULTITAP_CONFIG['min_tap_delay'] = _MULTITAP_CONFIG['tap_interval'] * 0.25
-        debug(f"## multitap_config: min_tap_delay ({original_delay}s) >= tap_interval, "
-                f"adjusted to {_MULTITAP_CONFIG['min_tap_delay']:.3f}s")
-
-
-# Grace period (seconds) between tap-sequence finalization and action emission.
-# Long enough for an already-in-flight modifier release to be processed by the
-# loop (so resume_keys lifts the trigger mods before the macro starts), short
-# enough to be imperceptible. Tunable; kept well under min_tap_delay.
-_MULTITAP_EMIT_GRACE = 0.15
-
-
-def isMultiTap( tap_1_action: 'Callable | None' = None,
-                tap_2_action: 'Callable | None' = None,
-                tap_3_action: 'Callable | None' = None,
-                tap_4_action: 'Callable | None' = None,
-                tap_5_action: 'Callable | None' = None,
-                tap_interval: float = None,
-                min_tap_delay: float = None):    # returns Callable
-    """
-    Multi-tap handler that supports 1-5 taps with asyncio.
-
-    Args:
-        tap_1_action: Function to call on single tap (can be None to block single-tap)
-        tap_2_action: Function to call on double tap
-        tap_3_action: Function to call on triple tap
-        tap_4_action: Function to call on quadruple tap
-        tap_5_action: Function to call on quintuple tap
-        tap_interval: Max time between taps (None = use global config)
-        min_tap_delay: Min time between taps to avoid key repeat (None = use global config)
-
-    Returns:
-        Function that handles the tap detection
-    """
-
-    # Use global config values if not explicitly provided
-    if tap_interval is None:
-        tap_interval = _MULTITAP_CONFIG['tap_interval']
-    if min_tap_delay is None:
-        min_tap_delay = _MULTITAP_CONFIG['min_tap_delay']
-
-    # Use action tuple as unique identifier, converting lists to tuples for hashability
-    def make_hashable(action):
-        if isinstance(action, list):
-            return tuple(make_hashable(item) for item in action)
-        return action
-
-    action_key = (
-        make_hashable(tap_1_action),
-        make_hashable(tap_2_action),
-        make_hashable(tap_3_action),
-        make_hashable(tap_4_action),
-        make_hashable(tap_5_action)
-    )
-
-    def execute_action_for_tap_count(   tap_count: int,
-                                        captured_ctx,
-                                        tap_1_action,
-                                        tap_2_action,
-                                        tap_3_action,
-                                        tap_4_action,
-                                        tap_5_action):
-        """Execute the appropriate action based on tap count."""
-        actions = {
-            1: tap_1_action,
-            2: tap_2_action,
-            3: tap_3_action,
-            4: tap_4_action,
-            5: tap_5_action
-        }
-
-        action = actions.get(tap_count)
-        if action is not None:
-            try:
-                debug(f"## isMultiTap: Executing {tap_count}-tap action for {action_key}")
-                process_multitap_command(action, captured_ctx)
-                debug(f"## isMultiTap: Completed {tap_count}-tap action for {action_key}")
-            except Exception as e:
-                debug(f"## isMultiTap: Error executing {tap_count}-tap action: {e}")
-        else:
-            debug(f"## isMultiTap: No action defined for {tap_count} taps on {action_key}")
-
-    def finalize_taps(action_key: tuple, captured_ctx):
-        """Called when tap sequence is finalized. Defers the actual action
-        emission by a short grace period (via loop.call_later) so the event loop
-        can process any pending modifier-release events first; this lets the
-        keymapper lift the trigger modifiers through its normal resume path
-        before the action emits, avoiding per-character modifier wrapping without
-        touching output or keystate internals."""
-        if action_key not in tap_states:
-            return
-
-        state = tap_states[action_key]
-        tap_count = state['count']
-        debug(f"## isMultiTap: Finalizing {tap_count} taps for {action_key}")
-
-        # Snapshot the actions before cleaning up state.
-        stored_tap_1_action = state['tap_1_action']
-        stored_tap_2_action = state['tap_2_action']
-        stored_tap_3_action = state['tap_3_action']
-        stored_tap_4_action = state['tap_4_action']
-        stored_tap_5_action = state['tap_5_action']
-
-        # Clean up state now; the deferred emit below captures everything it
-        # needs, so the per-combo state entry is free to go.
-        del tap_states[action_key]
-
-        def _emit():
-            execute_action_for_tap_count(   tap_count,
-                                            captured_ctx,
-                                            stored_tap_1_action,
-                                            stored_tap_2_action,
-                                            stored_tap_3_action,
-                                            stored_tap_4_action,
-                                            stored_tap_5_action)
-
-        loop = get_loop()
-        if loop is None:
-            # No loop to reschedule on: emit inline rather than drop the action.
-            # Worst case is per-character wrapping (slower), never a lost action.
-            debug("## isMultiTap: no loop for grace delay, emitting inline")
-            _emit()
-            return
-
-        loop.call_later(_MULTITAP_EMIT_GRACE, _emit)
-
-    def _isMultiTap(ctx) -> None:
-        loop = get_loop()
-        if loop is None:
-            debug(f"## isMultiTap: No event loop available for {action_key}")
-            return None
-
-        current_time = time.time()
-
-        # Initialize or get existing state
-        if action_key not in tap_states:
-            tap_states[action_key] = {
-                'count': 0,
-                'last_tap_time': 0.0,
-                'finalize_handle': None,
-                'captured_ctx': ctx,
-                # Store the individual actions in the state
-                'tap_1_action': tap_1_action,
-                'tap_2_action': tap_2_action,
-                'tap_3_action': tap_3_action,
-                'tap_4_action': tap_4_action,
-                'tap_5_action': tap_5_action,
-            }
-
-        state = tap_states[action_key]
-        time_since_last = current_time - state['last_tap_time']
-
-        # Check if this tap is too soon (key repeat protection)
-        if state['count'] > 0 and time_since_last < min_tap_delay:
-            debug(  f"## isMultiTap: Ignoring repeat for {action_key} "
-                    f"(too soon: {time_since_last:.3f}s)")
-            return None
-
-        # Check if this tap is too late (start new sequence)
-        if state['count'] > 0 and time_since_last >= tap_interval:
-            debug(  f"## isMultiTap: Too late for {action_key} "
-                    f"(gap: {time_since_last:.3f}s), finalizing previous")
-            # Finalize the previous sequence with its captured context
-            finalize_taps(action_key, state['captured_ctx'])
-            # Start new sequence with current context
-            tap_states[action_key] = {
-                'count': 0,
-                'last_tap_time': 0.0,
-                'finalize_handle': None,
-                'captured_ctx': ctx,
-                # Store the individual actions in the state
-                'tap_1_action': tap_1_action,
-                'tap_2_action': tap_2_action,
-                'tap_3_action': tap_3_action,
-                'tap_4_action': tap_4_action,
-                'tap_5_action': tap_5_action,
-            }
-            state = tap_states[action_key]
-
-        # Cancel any pending finalization
-        finalize_handle: 'asyncio.Handle | None' = state['finalize_handle']
-        if finalize_handle is not None:
-            finalize_handle.cancel()
-            state['finalize_handle'] = None
-
-        # Increment tap count
-        state['count'] += 1
-        state['last_tap_time'] = current_time
-
-        debug(f"## isMultiTap: Tap #{state['count']} for {action_key}")
-
-        # If we've exceeded max taps (5), ignore subsequent taps
-        if state['count'] > 5:
-            debug(f"## isMultiTap: Ignoring tap beyond maximum (tap #{state['count']})")
-            return None
-
-        # Schedule finalization after the interval for all tap counts
-        if state['tap_1_action'] or state['count'] > 1:
-            captured_ctx = state['captured_ctx']
-            handle: asyncio.Handle = loop.call_later(
-                tap_interval,
-                lambda: finalize_taps(action_key, captured_ctx)  # Pass captured context
-            )
-            state['finalize_handle'] = handle
-            debug(f"## isMultiTap: Scheduled finalization for {action_key} in {tap_interval}s")
-
-        # Return None since we're handling actions asynchronously
-        return None
-
-    return _isMultiTap
+    debug("## multitap_config: DEPRECATED, use "
+            "timeouts(tap_interval=..., min_tap_delay=...) instead")
+    timeouts(tap_interval=tap_interval, min_tap_delay=min_tap_delay)
 
 
 
@@ -1923,6 +1703,51 @@ def isMultiTap( tap_1_action: 'Callable | None' = None,
 # DO NOT REMOVE THIS MODMAP AND KEYMAP!
 # Special modmap to trigger the evaluation of the keyboard type when
 # any modifier key is pressed (UPDATE: And some common app class conditions).
+###################################################################################################
+###  SCAN_MARK_START: modmap_region  ###  MACHINE-VERIFIED REGION (see tests/modmap_verifier_*)
+# Everything between the SCAN_MARK lines is exec'd and exhaustively resolved by the modmap
+# region verifier (all capslock_mode values x keyboard types x app contexts). Names referenced
+# by `when` clauses in this region must either be defined inside it or stubbed by the verifier
+# harness. NOTE: "SCAN_MARK" is deliberately not "SLICE_MARK" - the setup script must never
+# harvest this region from an old config during upgrades.
+
+
+def _update_caps_mode_flags():
+    """Derive the per-mode ctx_caps_is_* booleans from cnfg.capslock_mode.
+
+    Called once per event from _context_pre_check(), so the `when` clauses
+    of the capslock_mode modmaps below read cached booleans instead of
+    repeating string comparisons. Validates the mode string against the
+    canonical tuple and degrades loudly to the default on unknown values
+    (a typo'd mode must never become a silent no-op).
+    """
+    global ctx_caps_is_caps
+    global ctx_caps_is_caps_and_cmd
+    global ctx_caps_is_cmd
+    global ctx_caps_is_esc_and_cmd
+    global ctx_caps_is_esc_and_lctrl
+    global ctx_caps_is_esc_and_lctrl_role_swap
+    global ctx_caps_is_lctrl_role_swap
+    global ctx_caps_swaps_lctrl
+
+    caps_mode = cnfg.capslock_mode
+    if caps_mode not in CAPSLOCK_MODES:
+        error(f"Unknown capslock_mode '{caps_mode}', "
+                f"treating as default '{CAPSLOCK_MODE_DEFAULT}'")
+        caps_mode = CAPSLOCK_MODE_DEFAULT
+
+    ctx_caps_is_caps                    = (caps_mode == 'caps_is_caps')
+    ctx_caps_is_caps_and_cmd            = (caps_mode == 'caps_is_caps_and_cmd')
+    ctx_caps_is_cmd                     = (caps_mode == 'caps_is_cmd')
+    ctx_caps_is_esc_and_cmd             = (caps_mode == 'caps_is_esc_and_cmd')
+    ctx_caps_is_esc_and_lctrl           = (caps_mode == 'caps_is_esc_and_lctrl')
+    ctx_caps_is_esc_and_lctrl_role_swap = (caps_mode == 'caps_is_esc_and_lctrl_role_swap')
+    ctx_caps_is_lctrl_role_swap         = (caps_mode == 'caps_is_lctrl_role_swap')
+
+    ctx_caps_swaps_lctrl                = (ctx_caps_is_esc_and_lctrl_role_swap
+                                            or ctx_caps_is_lctrl_role_swap)
+
+
 modmap("Trigger Modmap: Context Pre-Check", {
     # This modmap must have all modifier keys inside it, so they will
     # all trigger the re-evaluation of the keyboard type.
@@ -1937,6 +1762,10 @@ modmap("Trigger Modmap: Context Pre-Check", {
     Key.RIGHT_CTRL:             Key.RIGHT_CTRL,
     Key.LEFT_SHIFT:             Key.LEFT_SHIFT,
     Key.RIGHT_SHIFT:            Key.RIGHT_SHIFT,
+    # CapsLock is not a standard modifier, but capslock_mode features make it act
+    # like one, so a Caps press must also refresh the cached context (fresh
+    # terminal/GUI and keyboard type state) before its modmaps resolve.
+    Key.CAPSLOCK:               Key.CAPSLOCK,
 # }, when = lambda ctx: getKBtype()(ctx) )    # THIS CONDITIONAL MUST NEVER EVALUATE TO TRUE!
 }, when = _context_pre_check )    # THIS CONDITIONAL MUST NEVER EVALUATE TO TRUE!
 # Special keymap to trigger the evaluation of the keyboard type when
@@ -2069,22 +1898,72 @@ multipurpose_modmap("Enter2Cmd", {
     not ctx_app_is_remote
 )
 
-multipurpose_modmap("Caps2Esc - not Chromebook kbd", {
-    Key.CAPSLOCK:               [Key.ESC, Key.RIGHT_CTRL]       # Caps2Esc - not Chromebook
+# [capslock_mode multipurpose modmaps] Tap-bearing Caps modes. One mode value can ever be
+# active at a time (see _update_caps_mode_flags), so these can never race each other, and
+# no plain modmap below may claim the same inkey while one of these is live (a plain modmap
+# rewriting keystate.key would silently null the multi - selection is by inkey, application
+# is by key). Design matrix: docs/design/capslock_mode_matrix.md
+
+multipurpose_modmap("Caps mode - caps_and_cmd - not Cbk kbd", {
+    # Tap keeps the normal CapsLock toggle (useful for international layouts
+    # with Caps-layer characters); hold is the Cmd key equivalent. Same shape
+    # as the Enter2Ent_Cmd multi (tap passes the key's own identity through).
+    # Not registered for Chromebook: no Caps toggle exists there at all.
+    Key.CAPSLOCK:               [Key.CAPSLOCK, Key.RIGHT_CTRL]  # tap CapsLock / hold Cmd
 }, when = lambda ctx:
-    cnfg.Caps2Esc_Cmd and
+    ctx_caps_is_caps_and_cmd and
     cnfg.screen_has_focus and
     not ctx_kbd_is_chromebook and
     not ctx_app_is_remote
 )
 
-multipurpose_modmap("Caps2Esc - Chromebook kbd", {
-    Key.LEFT_META:               [Key.ESC, Key.RIGHT_CTRL]       # Caps2Esc - Chromebook
+multipurpose_modmap("Caps mode - esc_and_cmd - not Cbk kbd", {
+    Key.CAPSLOCK:               [Key.ESC, Key.RIGHT_CTRL]       # tap Esc / hold Cmd
 }, when = lambda ctx:
-    cnfg.Caps2Esc_Cmd and
+    ctx_caps_is_esc_and_cmd and
+    cnfg.screen_has_focus and
+    not ctx_kbd_is_chromebook and
+    not ctx_app_is_remote
+)
+
+multipurpose_modmap("Caps mode - esc_and_cmd - Cbk kbd", {
+    Key.LEFT_META:              [Key.ESC, Key.RIGHT_CTRL]       # tap Esc / hold Cmd (Cbk Caps position)
+}, when = lambda ctx:
+    ctx_caps_is_esc_and_cmd and
     cnfg.screen_has_focus and
     ctx_kbd_is_chromebook and
     not ctx_app_is_remote
+)
+
+multipurpose_modmap("Caps mode - esc_and_lctrl - Mac/Win kbd", {
+    # Literal Left Ctrl on hold, in GUI apps as well as terminals. First LEFT_CTRL
+    # source in GUI apps; native app Ctrl shortcuts (never remapped by Toshy) respond.
+    Key.CAPSLOCK:               [Key.ESC, Key.LEFT_CTRL]        # tap Esc / hold real Ctrl
+}, when = lambda ctx:
+    ctx_caps_is_esc_and_lctrl and
+    cnfg.screen_has_focus and
+    (ctx_kbd_is_apple or ctx_kbd_is_windows) and
+    not ctx_app_is_remote
+)
+
+multipurpose_modmap("Caps mode - esc_and_lctrl_role_swap - GUI - Mac/Win kbd", {
+    # Hold takes over Left Ctrl's contextual role: Super in GUI apps. The
+    # displaced Left Ctrl key becomes literal CapsLock (companion modmap below).
+    Key.CAPSLOCK:               [Key.ESC, Key.LEFT_META]        # tap Esc / hold Super (L-Ctrl GUI role)
+}, when = lambda ctx:
+    ctx_caps_is_esc_and_lctrl_role_swap and
+    cnfg.screen_has_focus and
+    (ctx_kbd_is_apple or ctx_kbd_is_windows) and
+    not ctx_app_is_terminal and not ctx_app_is_remote
+)
+
+multipurpose_modmap("Caps mode - esc_and_lctrl_role_swap - Terms - Mac/Win kbd", {
+    Key.CAPSLOCK:               [Key.ESC, Key.LEFT_CTRL]        # tap Esc / hold real Ctrl (L-Ctrl Terms role)
+}, when = lambda ctx:
+    ctx_caps_is_esc_and_lctrl_role_swap and
+    cnfg.screen_has_focus and
+    (ctx_kbd_is_apple or ctx_kbd_is_windows) and
+    ctx_app_is_terminal
 )
 
 multipurpose_modmap("Cond multi-modmap - Alt_Gr on Menu key", {
@@ -2354,23 +2233,68 @@ multipurpose_modmap("Left Opt is Sup & Opt - Win kbd", {
 )
 
 
-# [Global GUI conditional modmaps] Change modifier keys as in xmodmap
-modmap("Cond modmap - GUI - Caps2Cmd - not Cbk kdb", {
-    Key.CAPSLOCK:               Key.RIGHT_CTRL,                 # Caps2Cmd
+# [capslock_mode plain modmaps] Registered ahead of the base GUI/Terms modmaps below, so a
+# live Caps mode claims CAPSLOCK (and the swap companion claims LEFT_CTRL) before the base
+# entries can (apply_modmap is first-match-wins per inkey). Only one mode value can ever be
+# active (see _update_caps_mode_flags). Design matrix: docs/design/capslock_mode_matrix.md
+
+modmap("Caps mode - L-Ctrl displacement - Mac/Win kbd", {
+    # Shared companion for both *_role_swap modes: the displaced Left Ctrl key becomes a
+    # literal CapsLock. Must contain ONLY Left Ctrl - adding CAPSLOCK here would rewrite
+    # keystate.key ahead of apply_multi_modmap and silently null the tap-bearing swap mode.
+    # Output is CAPSLOCK in both contexts, so no GUI/Terms split is needed.
+    Key.LEFT_CTRL:              Key.CAPSLOCK,                   # displaced L-Ctrl is CapsLock
 }, when = lambda ctx:
-    cnfg.Caps2Cmd and
+    ctx_caps_swaps_lctrl and
+    cnfg.screen_has_focus and
+    (ctx_kbd_is_apple or ctx_kbd_is_windows) and
+    not ctx_app_is_remote
+)
+modmap("Caps mode - lctrl_role_swap - GUI - Mac/Win kbd", {
+    Key.CAPSLOCK:               Key.LEFT_META,                  # L-Ctrl's GUI role (Super)
+}, when = lambda ctx:
+    ctx_caps_is_lctrl_role_swap and
+    cnfg.screen_has_focus and
+    (ctx_kbd_is_apple or ctx_kbd_is_windows) and
+    not ctx_app_is_terminal and not ctx_app_is_remote
+)
+modmap("Caps mode - lctrl_role_swap - Terms - Mac/Win kbd", {
+    Key.CAPSLOCK:               Key.LEFT_CTRL,                  # L-Ctrl's Terms role (real Ctrl)
+}, when = lambda ctx:
+    ctx_caps_is_lctrl_role_swap and
+    cnfg.screen_has_focus and
+    (ctx_kbd_is_apple or ctx_kbd_is_windows) and
+    ctx_app_is_terminal
+)
+modmap("Caps mode - cmd - GUI - not Cbk kbd", {
+    Key.CAPSLOCK:               Key.RIGHT_CTRL,                 # Caps is Cmd
+}, when = lambda ctx:
+    ctx_caps_is_cmd and
     cnfg.screen_has_focus and
     not ctx_kbd_is_chromebook and
     not ctx_app_is_terminal and not ctx_app_is_remote
 )
-modmap("Cond modmap - GUI - Caps2Cmd - Cbk kdb", {
-    Key.LEFT_META:              Key.RIGHT_CTRL,                 # Caps2Cmd - Chromebook
+modmap("Caps mode - cmd - GUI - Cbk kbd", {
+    Key.LEFT_META:              Key.RIGHT_CTRL,                 # Caps is Cmd (Cbk Caps position)
 }, when = lambda ctx:
-    cnfg.Caps2Cmd and
+    ctx_caps_is_cmd and
     cnfg.screen_has_focus and
     ctx_kbd_is_chromebook and
     not ctx_app_is_terminal and not ctx_app_is_remote
 )
+modmap("Caps mode - cmd - Terms - Mac/Win kbd", {
+    # Gap A fix: legacy Caps2Cmd was GUI-only, leaving Caps as a live caps-lock
+    # toggle in terminals. The mode now covers terminals on Mac/Win as well.
+    Key.CAPSLOCK:               Key.RIGHT_CTRL,                 # Caps is Cmd
+}, when = lambda ctx:
+    ctx_caps_is_cmd and
+    cnfg.screen_has_focus and
+    (ctx_kbd_is_apple or ctx_kbd_is_windows) and
+    ctx_app_is_terminal
+)
+
+
+# [Global GUI conditional modmaps] Change modifier keys as in xmodmap
 modmap("Cond modmap - GUI - IBM kbd - multi_lang OFF", {
     # - IBM
     Key.RIGHT_ALT:              Key.RIGHT_CTRL,                 # IBM - Multi-language (Remove)
@@ -2588,6 +2512,10 @@ modmap("Cond modmap - Terms - Mac kbd - Cmd held", {
     ctx_kbd_is_apple and
     ctx_app_is_terminal
 )
+
+
+###  SCAN_MARK_END: modmap_region  ###  MACHINE-VERIFIED REGION (see tests/modmap_verifier_*)
+###################################################################################################
 
 
 # Suggested location for adding custom modmaps for personal use.
@@ -3614,7 +3542,7 @@ keymap("Escape actions for dead keys", {
     C("RC-Tab"):        [getDK(),bind,C("Alt-Tab"),setDK(None)],            # Leave accent char, task switch
     C("Shift-RC-Tab"):  [getDK(),bind,C("Shift-Alt-Tab"),setDK(None)],      # Leave accent char, task switch (reverse)
     C("RC-Grave"):      [getDK(),bind,C("Alt-Grave"),setDK(None)],          # Leave accent char, in-app window switch
-    C("Shift-RC-Tab"):  [getDK(),bind,C("Shift-Alt-Grave"),setDK(None)],    # Leave accent char, in-app window switch (reverse)
+    C("Shift-RC-Grave"):[getDK(),bind,C("Shift-Alt-Grave"),setDK(None)],    # Leave accent char, in-app window switch (reverse)
 
     # common shortcuts that should also cancel dead keys
     C("RC-a"):                  [getDK(),C("C-a"),setDK(None)],             # Leave accent char, select all
@@ -4128,6 +4056,30 @@ keymap("User hardware keys", {
 
 
 try:
+    setup_spotlight_input_keymaps(
+        globals(),
+        when = lambda ctx:
+            ctx_ovl_macos_globals and
+            cnfg.screen_has_focus and
+            not ctx_app_is_remote
+    )
+except NameError:
+    debug('SPOTL: setup_spotlight_input_keymaps not available; skipping.')
+
+
+try:
+    setup_screenshot_keymaps(
+        globals(),
+        when = lambda ctx:
+            ctx_ovl_macos_globals and
+            cnfg.screen_has_focus and
+            not ctx_app_is_remote
+    )
+except NameError:
+    error('SSHOT: setup_screenshot_keymaps not available')
+
+
+try:
     setup_level3_combos_via_left_alt(
         when = lambda ctx:
             ctx_ovl_level3_left_alt and
@@ -4135,7 +4087,7 @@ try:
             not (ctx_app_is_terminal or ctx_app_is_remote)
     )
 except NameError:
-    pass
+    error('setup_level3_combos_via_left_alt not available')
 
 
 #################################  MISC APPS  #####################################
@@ -4151,27 +4103,58 @@ except NameError:
 ###################################################################################
 # Miscellaneous apps that need a few fixes
 
-hmp_is_thunderbird              = matchProps(clas="^thunderbird.*$|^org.mozilla.thunderbird$")
-keymap("Thunderbird email client", {
+
+# Gecko ignores Ctrl+Shift+Backspace, which is what General GUI emits for Cmd+Backspace,
+# so the compose editor needs the same select-then-delete treatment as the Firefox keymap.
+#
+# THE WINDOW NAME MATCH IS LOAD-BEARING. RC-Delete is safe here ONLY because it is confined
+# to the compose window. In the message list, folder pane, address book, contact list,
+# calendar or task list, Shift+End extends the selection to the end of the list and Delete
+# is the live delete binding for all of those object types. Never widen this to class-only.
+keymap("Thunderbird compose wndw", {
+    C("Alt-RC-I"):              C("Shift-C-I"),                 # Dev tools
+    # Wordwise shortcuts (overrides of general wordwise)
+    C("RC-Backspace"):         [C("Shift-Home"),
+                                C("Backspace")],                # Delete Line Left of Cursor
+    # NEVER allow this to work in the main Thunderbird window. Could delete ENTIRE FOLDER of emails.
+    C("RC-Delete"):            [C("Shift-End"), C("Delete")],   # Delete Line Right of Cursor
+}, when = lambda ctx:
+    cnfg.screen_has_focus and
+    ctx_ovl_macos_globals and
+    hmp_is_tbird_compose(ctx) )
+
+
+# Isolate non-compose windows from compose windows in Thunderbird. See notes above.
+keymap("Thunderbird NOT compose wndw", {
     C("Alt-RC-I"):              C("Shift-C-I"),                 # Dev tools
     # Enable Cmd+Option+Left/Right for tab navigation
     C("RC-Alt-Left"):          [bind,C("C-Page_Up")],           # Go to prior tab (macOS Thunderbird tab nav shortcut)
     C("RC-Alt-Right"):         [bind,C("C-Page_Down")],         # Go to next tab (macOS Thunderbird tab nav shortcut)
+
+    # NEVER allow this to work in the main Thunderbird window. Could delete ENTIRE FOLDER of emails.
+    ### Cmd+Delete (forward delete): [Shift-End, Delete],       # Delete Line Right of Cursor (pseudo-code for safety)
+
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     ctx_ovl_macos_globals and
-    hmp_is_thunderbird(ctx) )
+    hmp_not_tbird_compose(ctx) )
+
 
 hmp_is_angry_ipscan             = matchProps(clas="^Angry.*IP.*Scanner$")
 keymap("Angry IP Scanner", {
-    C("RC-comma"):              C("Shift-C-P"),                 # Open preferences
-    C("RC-i"):                  C("Alt-Enter"),                 # Get info (details)
-    C("RC-h"):                  C("C-h"),                       # Go to next live host (override hide window)
-    C("Shift-RC-i"):            C("C-i"),                       # Invert selection
+    C("RC-comma"):              C("Shift-C-P"),                 # Open preferences (macOS Cmd+Comma)
+    # This keymap was remapping Cmd+I to Alt+Enter previously, for Details dialog.
+    # Details window opens on Enter or double-click (SWT.Traverse / TRAVERSE_RETURN in
+    # CommandsMenuActions.Details) - no accelerator on any platform, nothing to remap.
+    C("RC-i"):                  C("C-i"),                       # Invert selection (macOS Cmd+I)
+    C("RC-n"):                  C("C-h"),                       # Next alive host (macOS Cmd+N)
+    C("Shift-RC-n"):            C("Shift-C-h"),                 # Previous alive host (macOS Shift+Cmd+N)
+    C("Shift-RC-comma"):        C("Shift-C-o"),                 # Select Fetchers (macOS Shift+Cmd+comma)
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     ctx_ovl_macos_globals and
     hmp_is_angry_ipscan(ctx) )
+
 
 hmp_is_transmission             = matchProps(clas=transmissionStr)
 keymap("Transmission bittorrent client", {
@@ -4181,6 +4164,7 @@ keymap("Transmission bittorrent client", {
     cnfg.screen_has_focus and
     ctx_ovl_macos_globals and
     hmp_is_transmission(ctx) )
+
 
 _jdownloader_closures           = [matchProps(**dct) for dct in JDownloader_lod]
 hmp_is_jdownloader              = lambda ctx: any(c(ctx) for c in _jdownloader_closures)
@@ -4200,6 +4184,7 @@ keymap("JDownloader", {
     ctx_ovl_macos_globals and
     hmp_is_jdownloader(ctx) )
 
+
 hmp_is_totem                    = matchProps(clas="^totem$")
 keymap("Totem video player", {
     C("RC-dot"):                C("C-q"),                       # Stop (quit player, there is no "Stop" function)
@@ -4208,6 +4193,7 @@ keymap("Totem video player", {
     ctx_ovl_macos_globals and
     hmp_is_totem(ctx) )
 
+
 hmp_is_eog                      = matchProps(clas="^eog$")
 keymap("GNOME image viewer", {
     C("RC-i"):                  C("Alt-Enter"),                 # Image properties
@@ -4215,6 +4201,7 @@ keymap("GNOME image viewer", {
     cnfg.screen_has_focus and
     ctx_ovl_macos_globals and
     hmp_is_eog(ctx) )
+
 
 hmp_is_libreoffice_writer       = matchProps(clas="^libreoffice-writer$")
 keymap("LibreOffice Writer", {
@@ -5002,17 +4989,16 @@ keymap("VSCodes", {
     C("Shift-RC-Right_Brace"):  C("C-PAGE_DOWN"),               # prev_view
 
     # VS Code Shortcuts
-    C("C-g"):                   ignore_combo,                   # cancel Go to Line...
-    C("Super-g"):               C("C-g"),                       # Go to Line...
-    C("F3"):                    ignore_combo,                   # cancel Find next
-    C("C-h"):                   ignore_combo,                   # cancel replace
-    C("C-Alt-f"):               C("C-h"),                       # replace
-    C("C-Shift-h"):             ignore_combo,                   # cancel replace_next
-    C("C-Alt-e"):               C("C-Shift-h"),                 # replace_next
-    C("f3"):                    ignore_combo,                   # cancel find_next
-    C("C-g"):                   C("f3"),                        # find_next
-    C("Shift-f3"):              ignore_combo,                   # cancel find_prev
-    C("C-Shift-g"):             C("Shift-f3"),                  # find_prev
+    C("Super-g"):               C("C-g"),                       # Emit Linux Go to Line... combo
+    # The Cmd+H "hide window" combo is now handled by the "General GUI" keymap, with notes.
+    # C("RC-h"):                  ignore_combo,                   # Block Linux replace input combo
+    C("RC-Alt-f"):              C("C-h"),                       # Emit Linux replace combo
+    C("RC-Shift-h"):            ignore_combo,                   # Block Linux replace_next input combo
+    C("RC-Alt-e"):              C("C-Shift-h"),                 # Emit Linux replace_next combo
+    C("F3"):                    ignore_combo,                   # Block Linux find_next input combo
+    C("RC-g"):                  C("F3"),                        # Emit Linux find_next combo
+    C("Shift-F3"):              ignore_combo,                   # Block Linux find_prev input combo
+    C("RC-Shift-g"):            C("Shift-F3"),                  # Emit Linux find_prev combo
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     ctx_ovl_vscode_shortcuts and
@@ -6128,6 +6114,25 @@ keymap("General GUI", {
     C("RC-Grave"):          [iEF2NT(),bind, C("Alt-Grave")],         # Default not-xfce4 - Cmd ` - Same App Switching
     C("Shift-RC-Grave"):    [iEF2NT(),bind, C("Alt-Shift-Grave")],   # Default not-xfce4 - Cmd ` - Same App Switching
 
+    # Cmd+H is macOS "Hide Application", a window management function. There is no portable
+    # Linux equivalent: the minimize combo is set by the window manager and does not converge
+    # across desktops (GNOME Super+H, KDE Super+PgDn, Deepin Super+N, Xfce4 Alt+F9). The
+    # working remaps therefore live in the DE/distro-specific "GenGUI overrides" keymaps
+    # further up, which win by being earlier in the lookup order.
+    #
+    # This entry is the catch-all for desktops with no override. Without it, Cmd+H reaches
+    # the focused app as a literal Ctrl+H and fires whatever that app binds there (e.g. Replace,
+    # in VSCode). Blocking is the correct default: Cmd+H is never a text or document
+    # shortcut on macOS, so no app should be receiving it.
+    #
+    # If Cmd+H is not minimizing (hiding) windows in your environment, it may need an override
+    # keymap in the section above, or your own custom keymap in the "user_apps" editable slice.
+    #
+    # An app that genuinely wants Ctrl+H should emit it from a macOS-equivalent-app combo in its
+    # own keymap rather than relying on Cmd+H leaking through. See the VSCodes keymap, where
+    # Cmd+Option+F produces Ctrl+H for Replace.
+    C("RC-H"):                  ignore_combo,                   # Block Cmd+H, no DE override matched
+
     # Fn to Alt style remaps
     C("RAlt-Enter"):            C("insert"),                    # Insert
 
@@ -6186,21 +6191,21 @@ keymap("General GUI", {
 )
 
 
-keymap("Diagnostics (isMultiTap)", {
+keymap("Diagnostics (MultiTap)", {
 
-    C("Shift-Alt-RC-i"): isMultiTap(
+    C("Shift-Alt-RC-i"): MultiTap(
                             # tap_1_action=None,  # Block single tap
                             tap_1_action=C("Shift-Alt-C-i"),    # Keep original single-tap combo
                             tap_2_action=notify_context,
                         ),
 
-    C("Shift-Alt-RC-h"): isMultiTap(
+    C("Shift-Alt-RC-h"): MultiTap(
                             tap_1_action=C("Shift-Alt-RC-h"),   # Keep original single-tap combo
                             tap_2_action=notify_context,
                             tap_3_action=lambda: print("\nTriple tap!\n"),  # Shows in terminal
                         ),
 
-    C("Shift-Alt-RC-t"): isMultiTap(
+    C("Shift-Alt-RC-t"): MultiTap(
                             tap_1_action=C("C-n"),          # Test single-tap by opening new window
                             tap_2_action=macro_tester,      # Types out a long test macro text
                             tap_3_action=[

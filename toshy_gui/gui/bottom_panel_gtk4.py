@@ -4,8 +4,7 @@ from gi.repository import Gtk, GLib
 
 from toshy_common.logger import debug
 
-# Configuration for help button appearance
-HELP_BUTTON_SIZE = 36  # Width and height in pixels - change here to resize all help buttons
+from toshy_gui.gui.app_css import BOTTOM_HELP_BTN_SIZE as HELP_BUTTON_SIZE
 
 
 class BottomPanel(Gtk.Box):
@@ -30,69 +29,22 @@ class BottomPanel(Gtk.Box):
         # Set up the panel layout
         self.setup_ui()
         
-        # Add margins
-        self.set_margin_top(20)
-        self.set_margin_bottom(20)
+        # Add margins (horizontal only - vertical gaps between panel sections
+        # are controlled solely by the main window's section spacing)
         self.set_margin_start(20)
         self.set_margin_end(20)
-        
-        # Connect to realize signal to set up CSS when widget is ready
-        self.connect('realize', self.on_realize)
         
         # Apply initial theme setting
         self.apply_initial_theme()
         
         debug("=== BottomPanel.__init__ completed ===")
         
-    def on_realize(self, widget):
-        """Set up CSS when widget is realized and has a display"""
-        css_provider = Gtk.CssProvider()
-        
-        css_data = f"""
-        .debug-border {{
-            border: 2px solid red;
-            background-color: alpha(red, 0.1);
-        }}
-        .bottom-help-button {{
-            min-width: {HELP_BUTTON_SIZE}px;
-            min-height: {HELP_BUTTON_SIZE}px;
-            padding: 0px;
-            font-size: 18px;
-            font-weight: bold;
-        }}
-        .control-label {{
-            font-size: 24px;
-            font-weight: bold;
-            margin-right: 8px;
-        }}
-        .version-info {{
-            font-size: 14px;
-            font-weight: bold;
-            color: alpha(currentColor, 0.8);
-        }}
-        .info-text {{
-            font-size: 20px;
-            font-style: italic;
-            color: alpha(currentColor, 0.6);
-        }}
-        """
-        css_provider.load_from_data(css_data, -1)
-        
-        # Apply CSS to the display
-        display = self.get_display()
-        if display:
-            Gtk.StyleContext.add_provider_for_display(
-                display,
-                css_provider,
-                Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
-            )
-        
     def setup_ui(self):
         """Set up the bottom panel user interface"""
         debug("=== BottomPanel.setup_ui called ===")
         
-        # Set minimum height for the bottom panel to make alignment visible
-        self.set_size_request(-1, 60)
+        # Natural height only - no forced minimum. The labels and theme
+        # control define the panel height on their own.
         
         # Left side - Version and app info
         info_box = self.create_info_section()
@@ -225,6 +177,13 @@ class BottomPanel(Gtk.Box):
         else:
             new_theme = 'auto'
             
+        # No-change guard: the initial set_selected at construction and
+        # settings-monitor echoes fire this handler after cnfg already holds
+        # the value; saving again would rewrite the DB and re-emit settings
+        # in the config's verbose log.
+        if getattr(self.cnfg, 'gui_theme_mode', None) == new_theme:
+            return
+
         debug(f"Theme changed to: {new_theme}")
         
         # Save to settings
