@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-__version__ = '20260726'
+__version__ = '20261105'
 ###############################################################################
 ############################   Welcome to Toshy!   ############################
 ###
@@ -489,6 +489,7 @@ terminals = [
     "contour",
     "cutefish-terminal",
     "deepin-terminal",
+    "dev.limux.linux",
     "dev.warp.Warp",
     "eterm",
     ".*ghostty.*",
@@ -552,6 +553,7 @@ vscodes = [
     "code",
     "code - oss",
     "code-oss",
+    "com.microsoft.VSCode",
     "cursor",           # New VSCode variant with A.I.
     "vscodium",
 ]
@@ -651,8 +653,17 @@ vscodes_and_remotes_lod = [
     {lst: remotes_lod                    },
 ]
 
+# Brave has more than one app class string
+browsers_brave = [
+    "Brave-browser.*",          # Catches "brave-browser-beta", "brave-browser-nightly"
+    "com.brave.Browser.*",      # Flatpak app ID
+]
+browsers_brave          = [x.casefold() for x in browsers_brave]
+browsers_braveStr       = "|".join('^'+x+'$' for x in browsers_brave)
+
 browsers_chrome = [
-    "Brave-browser",
+    # unpack Brave list into this Chrome-based browser list
+    *browsers_brave,
     "Chromium",
     "Chromium-browser",
     "Falkon",
@@ -832,6 +843,8 @@ keyboards_Windows = [
 ]
 keyboards_Apple = [
     # Add specific Apple/Mac keyboard device names to this list
+    'Apple MTP keyboard',               # Seen on Fedora Asahi Linux, M2 MacBook Air
+    'Apple SPI Keyboard',               # Apple Silicon MacBook keyboard
     'HP TouchPad Wireless Keyboard',    # Missing some keys, but Apple type probably best default
     'Magic Keyboard with Numeric Keypad',
     'Magic Keyboard',
@@ -872,6 +885,11 @@ not_win_type_rgx    = re.compile("IBM|Chromebook|Apple", re.I)
 
 
 # Suggested location for customizing lists and variables for use with the "when" conditions.
+# List entries are regex patterns (case is ignored). A literal "*" or "+" in an app class
+# must be escaped, or replaced with ".*" to match the rest of the class.
+# After changing a list, rebuild its pattern string. For example:
+#     remotes.append("Some-Game.*")
+#     remoteStr = toRgxStr(remotes)
 ###################################################################################################
 ###  SLICE_MARK_START: user_custom_lists  ###  EDITS OUTSIDE THESE MARKS WILL BE LOST ON UPGRADE
 
@@ -897,6 +915,29 @@ not_win_type_rgx    = re.compile("IBM|Chromebook|Apple", re.I)
 
 # Instantiate a useful notification object class instance, to make notifications easier
 ntfy = NotificationManager(icon_file_active, title='Toshy Alert (Config)')
+
+
+_broken_cond_notify_cnt = 0
+_broken_cond_notify_max = 2
+
+
+def _on_broken_conditional(kind, name, exc):
+    """Surface a broken `when` conditional on the desktop, at most twice."""
+    global _broken_cond_notify_cnt
+    _broken_cond_notify_cnt += 1
+    if _broken_cond_notify_cnt > _broken_cond_notify_max:
+        return
+    if _broken_cond_notify_cnt == 1:
+        message = (f"Config error: {kind} '{name}' is disabled. "
+                    f"{exc.__class__.__name__}: {exc}. "
+                    f'Run "toshy-services-log" for details.')
+    else:
+        message = ('Config error: more than one keymap/modmap conditional is '
+                    'disabled. Run "toshy-services-log" for the full list.')
+    ntfy.send_notification(message=message, urgency='critical', replace_previous=False)
+
+
+on_conditional_error(_on_broken_conditional)
 
 
 def _purge_legacy_caps_prefs():
@@ -1198,7 +1239,7 @@ hmp_is_remote                   = matchProps(clas=remoteStr)        # Only neede
 # hmp_not_remote                  = matchProps(not_clas=remoteStr)                # not used currently
 hmp_is_terminal                 = matchProps(clas=termStr)
 # hmp_not_term_or_remote          = matchProps(not_clas=terms_and_remotes_Str)    # not used currently
-hmp_not_vscode_or_remote        = matchProps(not_clas=vscodes_and_remotes_Str)
+# hmp_not_vscode_or_remote        = matchProps(not_clas=vscodes_and_remotes_Str)  # not used currently
 hmp_is_vscode                   = matchProps(clas=vscodeStr)
 hmp_numlk_off                   = matchProps(numlk=False)           # Used for forced numpad feat.
 hmp_is_browser                  = matchProps(clas=browsers_allStr)
@@ -4690,7 +4731,7 @@ keymap("Overrides for Falkon browser", {
     hmp_is_falkon_browser(ctx) )
 
 # Brave is a Chromium-based web browser
-hmp_is_brave_browser            = matchProps(clas="^brave-browser$")
+hmp_is_brave_browser            = matchProps(clas=browsers_braveStr)
 keymap("Brave Browser Overrides", {
     # This won't do anything unless Brave's "Exit" shortcut is set to use Ctrl+Q
     C("RC-q"):                  C("RC-q"),                      # Quit Brave browser with Cmd+Q
@@ -4883,7 +4924,8 @@ keymap("Wordwise - not vscode", {
     #
 }, when = lambda ctx:
     cnfg.screen_has_focus and
-    hmp_not_vscode_or_remote(ctx)
+    not ctx_app_is_remote and
+    not hmp_is_vscode(ctx)
 )
 
 # Keybindings for VS Code and variants
@@ -5220,7 +5262,9 @@ keymap("Cmd+W dialog fix - Alt+F4", {
 ### Various fixes for supporting tab navigation shortcuts like Shift+Cmd+Braces
 
 
+# Apps that use Ctrl+Shift+Tab/Ctrl+Tab for tab nav (Shift+Cmd+Braces remap)
 tab_UI_fix_CtrlShiftTab_lst = [
+    "ai.storyteller.figcraft",
     "com.raggesilver.BlackBox",
     "com.system76.CosmicTerm",
     "org.gnome.Console|Console",
@@ -5231,23 +5275,68 @@ tab_UI_fix_CtrlShiftTab_lst = [
 ]
 tab_UI_fix_CtrlShiftTab_Str = toRgxStr(tab_UI_fix_CtrlShiftTab_lst)
 
+# Apps where Shift+Cmd+Left/Right should ALSO do Ctrl+Shift+Tab/Ctrl+Tab tab nav.
+# Overrides "Extend Selection to Beginning/End of Line" from General GUI, so no text-editing apps here.
+tab_UI_fix_CtrlShiftTab_arrows_lst = [
+    "com.raggesilver.BlackBox",
+    "com.system76.CosmicTerm",
+    "org.gnome.Console|Console",
+    "deepin-terminal",
+    "hyper",
+    "kitty",
+    "Kgx",
+]
+tab_UI_fix_CtrlShiftTab_arrows_Str = toRgxStr(tab_UI_fix_CtrlShiftTab_arrows_lst)
+
 tab_UI_fix_CtrlAltPgUp_lst = [
     "gedit",
     "xed",
 ]
 tab_UI_fix_CtrlAltPgUp_Str = toRgxStr(tab_UI_fix_CtrlAltPgUp_lst)
 
+# Apps that need literal Ctrl+Shift+[ / ] instead of the Shift+Cmd+Braces tab nav remaps.
+# Usually Adobe-like "Send to Back / Bring to Front", or Excel-like "select all precedents/dependents".
+tab_nav_braces_exempt_lst = [
+    "ai.storyteller.deckcraft",                 # Arrange: Send to Back / Bring to Front
+    "ai.storyteller.designcraft",               # Arrange: Send to Back / Bring to Front
+    "ai.storyteller.filmcraft",                 # Arrange: Send to Back / Bring to Front
+    "ai.storyteller.gridcraft",                 # Select all precedents / all dependents
+    "ai.storyteller.photocraft",                # Layer arrange: Send to Back / Bring to Front
+    "ai.storyteller.vectorcraft",               # Arrange: Send to Back / Bring to Front
+]
+tab_nav_braces_exempt_Str = toRgxStr(tab_nav_braces_exempt_lst)
+
+# Exempt listed apps from ALL Shift+Cmd+Braces tab nav remaps (must precede "Tab Nav fix" keymaps)
+hmp_is_tab_nav_braces_exempt    = matchProps(clas=tab_nav_braces_exempt_Str)
+keymap("Tab Nav exemption - literal Shift+Cmd+Braces", {
+    C("Shift-RC-Left_Brace"):   C("C-Shift-Left_Brace"),        # Literal Ctrl+Shift+[ (not tab nav)
+    C("Shift-RC-Right_Brace"):  C("C-Shift-Right_Brace"),       # Literal Ctrl+Shift+] (not tab nav)
+}, when = lambda ctx:
+    cnfg.screen_has_focus and
+    not ctx_app_is_remote and
+    hmp_is_tab_nav_braces_exempt(ctx)
+)
+
 # Tab navigation overrides for tabbed UI apps that use Ctrl+Shift+Tab/Ctrl+Tab instead of Ctrl+PgUp/PgDn
 hmp_is_tab_UI_fix_CtrlShiftTab  = matchProps(clas=tab_UI_fix_CtrlShiftTab_Str)
 keymap("Tab Nav fix for apps that use Ctrl+Shift+Tab/Ctrl+Tab", {
     C("Shift-RC-Left_Brace"):  [bind,C("C-Shift-Tab")],         # Tab nav: Go to prior tab (left)
     C("Shift-RC-Right_Brace"): [bind,C("C-Tab")],               # Tab nav: Go to next tab (right)
+}, when = lambda ctx:
+    cnfg.screen_has_focus and
+    ctx_ovl_dialog_ergo and
+    hmp_is_tab_UI_fix_CtrlShiftTab(ctx)
+)
+
+# Shift+Cmd+Left/Right tab navigation for apps that use Ctrl+Shift+Tab/Ctrl+Tab (not for text-editing apps)
+hmp_is_tab_UI_fix_CtrlShiftTab_arrows = matchProps(clas=tab_UI_fix_CtrlShiftTab_arrows_Str)
+keymap("Tab Nav fix for apps that use Ctrl+Shift+Tab/Ctrl+Tab - Shift+Cmd+Arrows", {
     C("Shift-RC-Left"):        [bind,C("C-Shift-Tab")],         # Tab nav: Go to prior tab (left)
     C("Shift-RC-Right"):       [bind,C("C-Tab")],               # Tab nav: Go to next tab (right)
 }, when = lambda ctx:
     cnfg.screen_has_focus and
     ctx_ovl_dialog_ergo and
-    hmp_is_tab_UI_fix_CtrlShiftTab(ctx)
+    hmp_is_tab_UI_fix_CtrlShiftTab_arrows(ctx)
 )
 
 # Tab navigation overrides for tabbed UI apps that use Ctrl+Alt+PgUp/PgDn instead of Ctrl+PgUp/PgDn
@@ -5505,8 +5594,8 @@ if DISTRO_ID == 'pop':
 if DISTRO_ID in ['ubuntu', 'fedora'] and DESKTOP_ENV == 'gnome':
     keymap("GenTerms overrides: Ubuntu/Fedora", {
         C("LC-RC-Q"):               C("Super-L"),                   # Lock screen (ubuntu/fedora)
-        C("LC-Right"):              [bind,C("Super-Page_Up")],      # SL - Change workspace (ubuntu/fedora)
-        C("LC-Left"):               [bind,C("Super-Page_Down")],    # SL - Change workspace (ubuntu/fedora)
+        C("LC-Right"):              [bind,C("Super-Page_Down")],    # SL - Change workspace (ubuntu/fedora)
+        C("LC-Left"):               [bind,C("Super-Page_Up")],      # SL - Change workspace (ubuntu/fedora)
     }, when = lambda ctx:
         cnfg.screen_has_focus and
         ctx_ovl_terminal_ergo and
@@ -5757,8 +5846,8 @@ if DISTRO_ID in ['fedora', 'almalinux'] and DESKTOP_ENV == 'gnome':
     keymap("GenGUI overrides: Fedora GNOME", {
         C("Super-RC-Q"):            C("Super-L"),                   # Lock screen (fedora)
         C("RC-H"):                  C("Super-h"),                   # Default SL - Minimize app (gnome/budgie/popos/fedora) not-deepin
-        C("Super-Right"):          [bind,C("Super-Page_Up")],       # SL - Change workspace (ubuntu/fedora)
-        C("Super-Left"):           [bind,C("Super-Page_Down")],     # SL - Change workspace (ubuntu/fedora)
+        C("Super-Right"):          [bind,C("Super-Page_Down")],     # SL - Change workspace (ubuntu/fedora)
+        C("Super-Left"):           [bind,C("Super-Page_Up")],       # SL - Change workspace (ubuntu/fedora)
     }, when = lambda ctx:
         cnfg.screen_has_focus and
         ctx_ovl_macos_globals and
@@ -5828,8 +5917,16 @@ if DISTRO_ID == 'pop':
 if DISTRO_ID == 'ubuntu':
     keymap("GenGUI overrides: Ubuntu", {
         C("Super-RC-Q"):            C("Super-L"),                   # Lock screen (ubuntu)
-        C("Super-Right"):          [bind,C("Super-Page_Up")],       # SL - Change workspace (ubuntu)
-        C("Super-Left"):           [bind,C("Super-Page_Down")],     # SL - Change workspace (ubuntu)
+    }, when = lambda ctx:
+        cnfg.screen_has_focus and
+        ctx_ovl_macos_globals and
+        not ctx_app_is_remote
+    )
+
+if DISTRO_ID == 'ubuntu' and DESKTOP_ENV == 'gnome':
+    keymap("GenGUI overrides: Ubuntu GNOME", {
+        C("Super-Right"):          [bind,C("Super-Page_Down")],     # SL - Change workspace (ubuntu)
+        C("Super-Left"):           [bind,C("Super-Page_Up")],       # SL - Change workspace (ubuntu)
     }, when = lambda ctx:
         cnfg.screen_has_focus and
         ctx_ovl_macos_globals and
